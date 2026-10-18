@@ -1,8 +1,11 @@
-# End-to-end test of part 1 on a real Windows machine:
-# Enable-Auditing -> strip a test folder's permissions with icacls ->
-# Get-PermissionReport must catch it -> Disable-Auditing must restore everything.
+# End-to-end test of parts 1 and 2 on a real Windows machine:
+# Part 1: Enable-Auditing -> strip a test folder's permissions with icacls ->
+#         Get-PermissionReport must catch it.
+# Part 2: Install-RepairTask -> strip folders -> the SYSTEM task must repair them,
+#         on demand and from the audit event -> Uninstall-RepairTask.
+# Finally Disable-Auditing must restore everything.
 # The runner is elevated, so the scripts run as they would from an admin prompt.
-name: Test part 1
+name: Test parts 1 and 2
 
 on:
   push:
@@ -19,7 +22,7 @@ permissions:
 jobs:
   test-part1:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         shell: powershell   # Windows PowerShell 5.1, same as on the laptop
@@ -29,7 +32,7 @@ jobs:
 
       - name: Prepare and record settings before the test
         run: |
-          . .\tests\Part1Helpers.ps1
+          . .\tests\TestHelpers.ps1
           if (-not (Test-Path -LiteralPath $PackagesPath)) {
               New-Item -ItemType Directory -Path $PackagesPath | Out-Null
               Write-Host "Created $PackagesPath (runner did not have it)"
@@ -43,7 +46,7 @@ jobs:
       - name: 1. Enable-Auditing.ps1
         id: enable
         run: |
-          . .\tests\Part1Helpers.ps1
+          . .\tests\TestHelpers.ps1
           & .\Enable-Auditing.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'enable-output.txt')
           $out   = Get-Content -LiteralPath (Join-Path $ArtifactDir 'enable-output.txt')
           $after = Get-AuditSnapshot
@@ -62,35 +65,15 @@ jobs:
 
       - name: 2. Strip the test folder to current-user-only
         run: |
-          . .\tests\Part1Helpers.ps1
-          if (Test-Path -LiteralPath $TestFolder) { Remove-Item -LiteralPath $TestFolder -Recurse -Force }
-          New-Item -ItemType Directory -Path $TestFolder | Out-Null
-          Set-Content -LiteralPath (Join-Path $TestFolder 'test.txt') -Value 'test'
-          Write-Host 'Before:'; & icacls.exe $TestFolder
-
-          # Mirrors what the real culprit does. icacls is started directly from this
-          # powershell.exe, so the report should show powershell.exe as its parent.
-          # New folders here can get explicit (not inherited) SYSTEM/Administrators
-          # entries, which /inheritance:r leaves alone, so remove those too in the same call.
-          $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-          & icacls.exe $TestFolder /inheritance:r /grant:r "${me}:(OI)(CI)F" /remove:g '*S-1-5-18' '*S-1-5-32-544'
-          if ($LASTEXITCODE -ne 0) { throw "icacls failed with exit code $LASTEXITCODE" }
-          Write-Host 'After:'; & icacls.exe $TestFolder
-
-          # The test is meaningless unless the folder really lost SYSTEM and Administrators.
-          $sids = ([System.IO.DirectoryInfo]$TestFolder).GetAccessControl('Access').GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
-              ForEach-Object { $_.IdentityReference.Value }
-          Assert-True ($sids -notcontains 'S-1-5-18') 'Test folder no longer has SYSTEM'
-          Assert-True ($sids -notcontains 'S-1-5-32-544') 'Test folder no longer has Administrators'
-          Complete-Assertions
-
-          # Remember which powershell.exe ran icacls, to check the report's parent PID.
+          . .\tests\TestHelpers.ps1
+          # icacls runs from this powershell.exe, so the report should show it as the parent.
+          New-StrippedTestFolder $TestFolder
           $PID | Set-Content -LiteralPath (Join-Path $ArtifactDir 'icacls-parent-pid.txt')
           Start-Sleep -Seconds 5   # let the events reach the Security log
 
       - name: 3. Get-PermissionReport.ps1
         run: |
-          . .\tests\Part1Helpers.ps1
+          . .\tests\TestHelpers.ps1
           & .\Get-PermissionReport.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'report-console.txt')
 
           $report = Get-ChildItem -LiteralPath (Join-Path $StateDir 'reports') -Filter 'PermissionReport_*.txt' -ErrorAction SilentlyContinue |
@@ -137,10 +120,85 @@ jobs:
           }
           Complete-Assertions
 
-      - name: 4. Disable-Auditing.ps1
+      - name: 4. Install-RepairTask.ps1
+        id: install
         if: ${{ !cancelled() && steps.enable.conclusion == 'success' }}
         run: |
-          . .\tests\Part1Helpers.ps1
+          . .\tests\TestHelpers.ps1
+          & .\Install-RepairTask.ps1 -WithAuditTrigger *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'install-repair-output.txt')
+          $out  = Get-Content -LiteralPath (Join-Path $ArtifactDir 'install-repair-output.txt')
+          $task = Get-ScheduledTask -TaskName $RepairTask -ErrorAction SilentlyContinue
+          Assert-True $task "Scheduled task '$RepairTask' is registered"
+          if (-not $task) { Complete-Assertions }
+          Export-ScheduledTask -TaskName $RepairTask | Set-Content -LiteralPath (Join-Path $ArtifactDir 'repair-task.xml')
+
+          Assert-True ($task.Principal.UserId -in 'SYSTEM', 'S-1-5-18', 'NT AUTHORITY\SYSTEM') "Task runs as SYSTEM (got '$($task.Principal.UserId)')"
+          Assert-True ($task.Principal.RunLevel -eq 'Highest') "Task runs with highest privileges (got '$($task.Principal.RunLevel)')"
+          Assert-True ($task.Settings.MultipleInstances -eq 'IgnoreNew') "One instance at a time (got '$($task.Settings.MultipleInstances)')"
+          $types = @($task.Triggers | ForEach-Object { $_.CimClass.CimClassName })
+          Assert-True ($types -contains 'MSFT_TaskLogonTrigger') "Has a logon trigger (got: $($types -join ', '))"
+          $evt = $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskEventTrigger' }
+          Assert-True ($evt -and $evt.Subscription -match 'EventID=4670') 'Has the audit-event (4670) trigger'
+          Assert-True ($task.Actions[0].Arguments -like "*$PackagesPath*") "Task has this user's Packages path built in (SYSTEM's %LOCALAPPDATA% differs)"
+
+          # The task runs as SYSTEM, so ordinary users must not be able to change the script it runs.
+          $script = Join-Path $StateDir 'Repair-Permissions.ps1'
+          Assert-True (Test-Path -LiteralPath $script) 'Repair script copied to C:\ProgramData\PermissionTrap'
+          # Only the bits that allow changing the file (Modify/FullControl also contain read bits).
+          $write = [System.Security.AccessControl.FileSystemRights]'Write, Delete, ChangePermissions, TakeOwnership'
+          $writers = @((Get-Acl -LiteralPath $script).Access | Where-Object {
+              $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $write) -and
+              $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -notin 'S-1-5-18', 'S-1-5-32-544'
+          } | ForEach-Object { "$($_.IdentityReference): $($_.FileSystemRights)" })
+          Assert-True ($writers.Count -eq 0) "Only SYSTEM and Administrators can change the repair script (others: $($writers -join '; '))"
+          Assert-True (-not ($out -match '\bWARN\b')) 'Install-RepairTask.ps1 printed no warnings'
+          Complete-Assertions
+
+      - name: 5. Repair on demand (Start-ScheduledTask)
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          New-StrippedTestFolder $RepairFolderA
+          Start-ScheduledTask -TaskName $RepairTask
+          $ok = Wait-Until 120 { (Test-HasSid $RepairFolderA 'S-1-5-18') -and (Test-Path -LiteralPath $RepairLog) -and
+                                 (Select-String -LiteralPath $RepairLog -Pattern 'FIXED\s+PermissionTrap\.RepairTestA\s' -Quiet) }
+          Write-Host "Repaired within 120 s: $ok"; Write-Host 'After repair:'; & icacls.exe $RepairFolderA
+          Assert-Repaired $RepairFolderA
+
+          # Let the run finish (it re-checks 30 s after a fix) and check it succeeded.
+          Assert-True (Wait-RepairTaskIdle) 'Task run finished'
+          $result = (Get-ScheduledTaskInfo -TaskName $RepairTask).LastTaskResult
+          Assert-True ($result -eq 0) "Task run exit code is 0 (got $result)"
+          Complete-Assertions
+
+      - name: 6. Repair from the audit event (no manual start)
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          Wait-RepairTaskIdle | Out-Null   # an earlier run would make the scheduler skip this trigger
+          New-StrippedTestFolder $RepairFolderB
+          # The trigger waits 30 s after the event, then the repair runs.
+          $ok = Wait-Until 180 { (Test-HasSid $RepairFolderB 'S-1-5-18') -and (Test-Path -LiteralPath $RepairLog) -and
+                                 (Select-String -LiteralPath $RepairLog -Pattern 'FIXED\s+PermissionTrap\.RepairTestB\s' -Quiet) }
+          Write-Host "Repaired by the event trigger within 180 s: $ok"; & icacls.exe $RepairFolderB
+          Assert-Repaired $RepairFolderB
+          Complete-Assertions
+
+      - name: 7. Uninstall-RepairTask.ps1
+        if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          Copy-Item -LiteralPath $RepairLog -Destination $ArtifactDir -ErrorAction SilentlyContinue
+          & .\Uninstall-RepairTask.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'uninstall-repair-output.txt')
+          Assert-True (-not (Get-ScheduledTask -TaskName $RepairTask -ErrorAction SilentlyContinue)) "Scheduled task '$RepairTask' is gone"
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $StateDir 'Repair-Permissions.ps1'))) 'Repair script copy removed'
+          Assert-True (Test-Path -LiteralPath $RepairLog) 'repair.log kept by default'
+          Complete-Assertions
+
+      - name: 8. Disable-Auditing.ps1
+        if: ${{ !cancelled() && steps.enable.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
           & .\Disable-Auditing.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'disable-output.txt')
           $out    = Get-Content -LiteralPath (Join-Path $ArtifactDir 'disable-output.txt')
           $before = Get-Content -LiteralPath $BeforeFile -Raw | ConvertFrom-Json
@@ -162,22 +220,25 @@ jobs:
       - name: Collect logs
         if: always()
         run: |
-          . .\tests\Part1Helpers.ps1
+          . .\tests\TestHelpers.ps1
           if (Test-Path -LiteralPath $StateDir) { Copy-Item -LiteralPath $StateDir -Destination (Join-Path $ArtifactDir 'ProgramData-PermissionTrap') -Recurse -Force }
           & auditpol.exe /get /category:* > (Join-Path $ArtifactDir 'auditpol-final.txt')
           & wevtutil.exe epl Security (Join-Path $ArtifactDir 'security-events.evtx') '/q:*[System[(EventID=4663 or EventID=4670 or EventID=4688)]]'
           Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4670, 4663 } -ErrorAction SilentlyContinue |
               Format-List TimeCreated, Id, Message | Out-File (Join-Path $ArtifactDir 'security-4670-4663.txt') -Width 300
-          if (Test-Path -LiteralPath $TestFolder) {
-              & icacls.exe $TestFolder > (Join-Path $ArtifactDir 'testfolder-acl-final.txt')
-              Remove-Item -LiteralPath $TestFolder -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($f in $TestFolder, $RepairFolderA, $RepairFolderB) {
+              if (-not (Test-Path -LiteralPath $f)) { continue }
+              & icacls.exe $f > (Join-Path $ArtifactDir "$(Split-Path $f -Leaf)-acl-final.txt")
+              Remove-Item -LiteralPath $f -Recurse -Force -ErrorAction SilentlyContinue
           }
+          Get-WinEvent -LogName 'Microsoft-Windows-TaskScheduler/Operational' -MaxEvents 200 -ErrorAction SilentlyContinue |
+              Format-List TimeCreated, Id, Message | Out-File (Join-Path $ArtifactDir 'taskscheduler-events.txt') -Width 300
           exit 0   # best effort: a failed export must not fail the job
 
       - name: Upload report and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: part1-test-results
+          name: test-results
           path: ${{ runner.temp }}/part1-artifacts
           if-no-files-found: warn
