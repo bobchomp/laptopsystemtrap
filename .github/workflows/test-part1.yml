@@ -128,6 +128,10 @@ jobs:
           $expectedPid = (Get-Content -LiteralPath (Join-Path $ArtifactDir 'icacls-parent-pid.txt')).Trim()
           Assert-True ($parentLine -match "\(PID $expectedPid,") "Parent PID matches the powershell.exe that ran icacls ($expectedPid)"
 
+          # The headline must name a real program, not the boot process at the very top of every chain.
+          $headline = @($lines -match '>>> WHAT DID IT: ') | Select-Object -First 1
+          Assert-True ($headline -and $headline -notmatch '\\(smss|wininit|services|svchost)\.exe ') "Headline names a program, not a Windows launcher (got: '$headline')"
+
           if (-not ($lines -match 'Result: .*removed SYSTEM')) {
               Write-Host '::warning::Report did not say "removed SYSTEM" (only seen when event 4670 fires with old/new SDDL)'
           }

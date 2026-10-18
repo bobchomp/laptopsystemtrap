@@ -386,17 +386,37 @@ function Show-PermissionChanges {
         } catch { return '' }
     }
 
-    # Plain-English hint about what kind of thing started the chain.
-    function Get-ChainHint($Chain) {
-        $names = @($Chain | ForEach-Object { if ($_.Name) { (Split-Path $_.Name -Leaf).ToLower() } })
-        $lines = @($Chain | ForEach-Object { [string]$_.CommandLine })
-        if ($lines -match 'svchost\.exe.*-s\s+Schedule' -or $names -contains 'taskeng.exe' -or $names -contains 'taskhostw.exe') {
-            return 'Looks like it was started by a SCHEDULED TASK (Task Scheduler). Check Task Scheduler for tasks that ran at this time.'
+    # Standard Windows processes that start other programs. With process-creation
+    # auditing on, every chain runs back to smss.exe, so these are skipped when
+    # picking the headline: the answer is the highest process BELOW them.
+    $Launchers = 'smss.exe', 'csrss.exe', 'wininit.exe', 'winlogon.exe', 'userinit.exe', 'services.exe',
+                 'svchost.exe', 'explorer.exe', 'taskhostw.exe', 'taskeng.exe', 'wmiprvse.exe', 'sihost.exe'
+
+    function Get-LeafName($Node) { if ($Node.Name) { (Split-Path $Node.Name -Leaf).ToLower() } else { '' } }
+
+    # Index in the chain of the "real answer": walking up from the process that
+    # changed permissions, the last one before the first Windows launcher.
+    function Get-HeadlineIndex($Chain) {
+        for ($i = 1; $i -lt $Chain.Count; $i++) {
+            if ($Launchers -contains (Get-LeafName $Chain[$i])) { return $i - 1 }
         }
-        if ($names -contains 'services.exe') { return 'Looks like it was started by a WINDOWS SERVICE (services.exe is in the chain).' }
-        if ($names -contains 'explorer.exe') { return 'Started from your desktop session (explorer.exe) - e.g. a program you or a startup entry launched.' }
-        if ($names -contains 'wmiprvse.exe') { return 'Started via WMI (wmiprvse.exe) - often management/remote tools or WMI event subscriptions.' }
-        return ''
+        return $Chain.Count - 1
+    }
+
+    # Plain-English hint based on the launcher that started the headline process.
+    function Get-LauncherHint($Launcher) {
+        if (-not $Launcher) { return '' }
+        $name = Get-LeafName $Launcher
+        if (($name -eq 'svchost.exe' -and $Launcher.CommandLine -match '-s\s+Schedule') -or $name -in 'taskhostw.exe', 'taskeng.exe') {
+            return 'Started by a SCHEDULED TASK (Task Scheduler). Check Task Scheduler for tasks that ran at this time.'
+        }
+        switch ($name) {
+            'services.exe' { return 'Started as a WINDOWS SERVICE (by services.exe).' }
+            'svchost.exe'  { return "Started by a Windows service host (svchost.exe$(if ($Launcher.CommandLine) { ": $($Launcher.CommandLine)" }))." }
+            'explorer.exe' { return 'Started from your desktop session (explorer.exe) - a program you or a startup entry launched.' }
+            'wmiprvse.exe' { return 'Started via WMI (wmiprvse.exe) - often management/remote tools or WMI event subscriptions.' }
+        }
+        return "Started by $name."
     }
 
     function Out-Burst($b, [switch]$Detailed) {
@@ -413,14 +433,16 @@ function Show-PermissionChanges {
         Out-Report "  Result: $($what -join '; ')" $color
         if (-not $Detailed) { return }
 
-        $chain = @(Get-ProcessChain $b.ProcessId $b.ProcessName $b.Start)
-        $top   = $chain[-1]
+        $chain    = @(Get-ProcessChain $b.ProcessId $b.ProcessName $b.Start)
+        $topIndex = Get-HeadlineIndex $chain
+        $top      = $chain[$topIndex]
+        $launcher = if ($topIndex + 1 -lt $chain.Count) { $chain[$topIndex + 1] } else { $null }
         Out-Report ''
-        Out-Report "  >>> TOP OF CHAIN: $($top.Name) (PID $($top.ProcessId))  $(Get-Publisher $top.Name)" 'Magenta'
+        Out-Report "  >>> WHAT DID IT: $($top.Name) (PID $($top.ProcessId))  $(Get-Publisher $top.Name)" 'Magenta'
         if ($top.Source -eq 'not found') {
             Out-Report '      (its start was not in the log - it started before auditing was on, or the log has rolled over)'
         }
-        $hint = Get-ChainHint $chain
+        $hint = Get-LauncherHint $launcher
         if ($hint) { Out-Report "      $hint" 'Magenta' }
 
         Out-Report ''
