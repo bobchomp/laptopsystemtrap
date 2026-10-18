@@ -1,0 +1,170 @@
+# End-to-end test of part 1 on a real Windows machine:
+# Enable-Auditing -> strip a test folder's permissions with icacls ->
+# Get-PermissionReport must catch it -> Disable-Auditing must restore everything.
+# The runner is elevated, so the scripts run as they would from an admin prompt.
+name: Test part 1
+
+on:
+  push:
+    paths:
+      - '*.ps1'
+      - 'tests/**'
+      - '.github/workflows/test-part1.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-part1:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell   # Windows PowerShell 5.1, same as on the laptop
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare and record settings before the test
+        run: |
+          . .\tests\Part1Helpers.ps1
+          if (-not (Test-Path -LiteralPath $PackagesPath)) {
+              New-Item -ItemType Directory -Path $PackagesPath | Out-Null
+              Write-Host "Created $PackagesPath (runner did not have it)"
+          }
+          if (Test-Path -LiteralPath $StateDir) { throw "$StateDir already exists - runner is not clean" }
+          $before = Get-AuditSnapshot
+          $before | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $BeforeFile -Encoding UTF8
+          Write-Host "User: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          Write-Host "Before:"; Get-Content -LiteralPath $BeforeFile
+
+      - name: 1. Enable-Auditing.ps1
+        id: enable
+        run: |
+          . .\tests\Part1Helpers.ps1
+          & .\Enable-Auditing.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'enable-output.txt')
+          $out   = Get-Content -LiteralPath (Join-Path $ArtifactDir 'enable-output.txt')
+          $after = Get-AuditSnapshot
+
+          foreach ($name in $Subcategories.Keys) {
+              $setting = $after.AuditSettings.($Subcategories[$name])
+              Assert-True ($setting -match 'Success') "$name auditing is '$setting' (expected Success)"
+          }
+          Assert-True $after.HasAuditRule 'Audit rule (Everyone, ChangePermissions+TakeOwnership, Success) is on the Packages folder'
+          Assert-True ($after.CmdLineValue -eq 1) "ProcessCreationIncludeCmdLine_Enabled is '$($after.CmdLineValue)' (expected 1)"
+          Assert-True ($after.SecurityLogMax -ge 134217728) "Security log max size is $($after.SecurityLogMax) (expected >= 128 MB)"
+          Assert-True (Test-Path -LiteralPath (Join-Path $StateDir 'audit-state.json')) 'audit-state.json was written'
+          Assert-True (Test-Path -LiteralPath (Join-Path $StateDir 'auditpol-backup.csv')) 'auditpol-backup.csv was written'
+          Assert-True (-not ($out -match '\bWARN\b')) 'Enable-Auditing.ps1 printed no warnings (DACL unchanged etc.)'
+          Complete-Assertions
+
+      - name: 2. Strip the test folder to current-user-only
+        run: |
+          . .\tests\Part1Helpers.ps1
+          if (Test-Path -LiteralPath $TestFolder) { Remove-Item -LiteralPath $TestFolder -Recurse -Force }
+          New-Item -ItemType Directory -Path $TestFolder | Out-Null
+          Set-Content -LiteralPath (Join-Path $TestFolder 'test.txt') -Value 'test'
+          Write-Host 'Before:'; & icacls.exe $TestFolder
+
+          # Mirrors what the real culprit does. icacls is started directly from this
+          # powershell.exe, so the report should show powershell.exe as its parent.
+          $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          & icacls.exe $TestFolder /inheritance:r /grant:r "${me}:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) { throw "icacls failed with exit code $LASTEXITCODE" }
+          Write-Host 'After:'; & icacls.exe $TestFolder
+
+          # Remember which powershell.exe ran icacls, to check the report's parent PID.
+          $PID | Set-Content -LiteralPath (Join-Path $ArtifactDir 'icacls-parent-pid.txt')
+          Start-Sleep -Seconds 5   # let the events reach the Security log
+
+      - name: 3. Get-PermissionReport.ps1
+        run: |
+          . .\tests\Part1Helpers.ps1
+          & .\Get-PermissionReport.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'report-console.txt')
+
+          $report = Get-ChildItem -LiteralPath (Join-Path $StateDir 'reports') -Filter 'PermissionReport_*.txt' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1
+          Assert-True $report 'Report file was saved'
+          if (-not $report) { Complete-Assertions }
+          $lines = @(Get-Content -LiteralPath $report.FullName)
+
+          # Which audit events actually fired for the test folder (the spec asks to verify 4670 vs 4663).
+          $ids = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4670, 4663 } -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -like "*PermissionTrap.TestFolder*" } | Group-Object Id |
+              ForEach-Object { "$($_.Name) x$($_.Count)" })
+          Write-Host "::notice::Events for the test folder: $(if ($ids) { $ids -join ', ' } else { 'none' })"
+
+          # The test folder must be listed under "Missing SYSTEM:" (section ends at the next blank line).
+          $start = [array]::IndexOf($lines, 'Missing SYSTEM:')
+          $missing = @()
+          if ($start -ge 0) {
+              for ($i = $start + 1; $i -lt $lines.Count -and $lines[$i].Trim(); $i++) { $missing += $lines[$i].Trim() }
+          }
+          Assert-True ($missing -match '^PermissionTrap\.TestFolder\b') 'Report lists PermissionTrap.TestFolder as missing SYSTEM'
+
+          # Find the process chain that starts with icacls.exe and check its parent (the next "^ " line).
+          $parentLine = $null
+          for ($i = 0; $i -lt $lines.Count -and -not $parentLine; $i++) {
+              if ($lines[$i] -notmatch '^    [^ ^].*\bicacls\.exe  \(PID \d+') { continue }
+              for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+                  if ($lines[$j] -match '^\s+\^ ') { $parentLine = $lines[$j]; break }
+                  if ($lines[$j] -match '^-{10,}|^\S') { break }   # next burst or section
+              }
+          }
+          Assert-True ($lines -match '^    [^ ^].*\bicacls\.exe  \(PID \d+') 'Report has a process chain starting with icacls.exe'
+          Assert-True ($parentLine -match '\\(powershell|pwsh)\.exe  \(PID') "icacls.exe's parent is powershell.exe/pwsh.exe (got: '$parentLine')"
+
+          $expectedPid = (Get-Content -LiteralPath (Join-Path $ArtifactDir 'icacls-parent-pid.txt')).Trim()
+          Assert-True ($parentLine -match "\(PID $expectedPid,") "Parent PID matches the powershell.exe that ran icacls ($expectedPid)"
+
+          if (-not ($lines -match 'Result: .*removed SYSTEM')) {
+              Write-Host '::warning::Report did not say "removed SYSTEM" (only seen when event 4670 fires with old/new SDDL)'
+          }
+          Complete-Assertions
+
+      - name: 4. Disable-Auditing.ps1
+        if: ${{ !cancelled() && steps.enable.conclusion == 'success' }}
+        run: |
+          . .\tests\Part1Helpers.ps1
+          & .\Disable-Auditing.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'disable-output.txt')
+          $out    = Get-Content -LiteralPath (Join-Path $ArtifactDir 'disable-output.txt')
+          $before = Get-Content -LiteralPath $BeforeFile -Raw | ConvertFrom-Json
+          $after  = Get-AuditSnapshot
+          $after | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $ArtifactDir 'snapshot-after.json') -Encoding UTF8
+
+          foreach ($name in $Subcategories.Keys) {
+              $guid = $Subcategories[$name]
+              $was = $before.AuditSettings.$guid; $now = $after.AuditSettings.$guid
+              Assert-True ($was -eq $now) "$name auditing restored (before '$was', now '$now')"
+          }
+          Assert-True ($before.CmdLineValue -eq $after.CmdLineValue) "ProcessCreationIncludeCmdLine_Enabled restored (before '$($before.CmdLineValue)', now '$($after.CmdLineValue)')"
+          Assert-True ($before.SecurityLogMax -eq $after.SecurityLogMax) "Security log size restored (before $($before.SecurityLogMax), now $($after.SecurityLogMax))"
+          Assert-True ($before.HasAuditRule -eq $after.HasAuditRule) "Packages audit rule restored (before $($before.HasAuditRule), now $($after.HasAuditRule))"
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $StateDir 'audit-state.json'))) 'audit-state.json removed after a clean restore'
+          Assert-True (-not ($out -match '\bWARN\b')) 'Disable-Auditing.ps1 printed no warnings'
+          Complete-Assertions
+
+      - name: Collect logs
+        if: always()
+        run: |
+          . .\tests\Part1Helpers.ps1
+          if (Test-Path -LiteralPath $StateDir) { Copy-Item -LiteralPath $StateDir -Destination (Join-Path $ArtifactDir 'ProgramData-PermissionTrap') -Recurse -Force }
+          & auditpol.exe /get /category:* > (Join-Path $ArtifactDir 'auditpol-final.txt')
+          & wevtutil.exe epl Security (Join-Path $ArtifactDir 'security-events.evtx') '/q:*[System[(EventID=4663 or EventID=4670 or EventID=4688)]]'
+          Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4670, 4663 } -ErrorAction SilentlyContinue |
+              Format-List TimeCreated, Id, Message | Out-File (Join-Path $ArtifactDir 'security-4670-4663.txt') -Width 300
+          if (Test-Path -LiteralPath $TestFolder) {
+              & icacls.exe $TestFolder > (Join-Path $ArtifactDir 'testfolder-acl-final.txt')
+              Remove-Item -LiteralPath $TestFolder -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          exit 0   # best effort: a failed export must not fail the job
+
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: part1-test-results
+          path: ${{ runner.temp }}/part1-artifacts
+          if-no-files-found: warn
