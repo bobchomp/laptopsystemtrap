@@ -70,10 +70,19 @@ jobs:
 
           # Mirrors what the real culprit does. icacls is started directly from this
           # powershell.exe, so the report should show powershell.exe as its parent.
+          # New folders here can get explicit (not inherited) SYSTEM/Administrators
+          # entries, which /inheritance:r leaves alone, so remove those too in the same call.
           $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-          & icacls.exe $TestFolder /inheritance:r /grant:r "${me}:(OI)(CI)F"
+          & icacls.exe $TestFolder /inheritance:r /grant:r "${me}:(OI)(CI)F" /remove:g '*S-1-5-18' '*S-1-5-32-544'
           if ($LASTEXITCODE -ne 0) { throw "icacls failed with exit code $LASTEXITCODE" }
           Write-Host 'After:'; & icacls.exe $TestFolder
+
+          # The test is meaningless unless the folder really lost SYSTEM and Administrators.
+          $sids = ([System.IO.DirectoryInfo]$TestFolder).GetAccessControl('Access').GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+              ForEach-Object { $_.IdentityReference.Value }
+          Assert-True ($sids -notcontains 'S-1-5-18') 'Test folder no longer has SYSTEM'
+          Assert-True ($sids -notcontains 'S-1-5-32-544') 'Test folder no longer has Administrators'
+          Complete-Assertions
 
           # Remember which powershell.exe ran icacls, to check the report's parent PID.
           $PID | Set-Content -LiteralPath (Join-Path $ArtifactDir 'icacls-parent-pid.txt')
