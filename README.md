@@ -1,80 +1,225 @@
 # Permission Trap
 
-Finds out what keeps removing `SYSTEM` and `Administrators` from
-`%LOCALAPPDATA%\Packages`, and puts them back.
+Something on this laptop keeps removing `SYSTEM` and `Administrators` from
+`%LOCALAPPDATA%\Packages`, which stops Store apps (Claude, eM Client…) from
+starting. Permission Trap finds out what's doing it, repairs the damage, and
+emails you about it.
 
-- **Part 1:** sets up Windows auditing and gives you a report to run by hand.
-- **Part 2:** adds a scheduled task that repairs the permissions automatically.
-- **Weekly check:** checks every Sunday and at every logon. It emails you every Sunday, and straight away at logon if anything is broken.
+| Part | What it gives you | Scripts |
+|---|---|---|
+| **1. Catch it** | Windows auditing, and a report that names the program that changed the permissions | `Enable-Auditing.ps1`, `Get-PermissionReport.ps1`, `Disable-Auditing.ps1` |
+| **2. Repair it** | A scheduled task (as SYSTEM) that puts the permissions back automatically | `Install-RepairTask.ps1`, `Uninstall-RepairTask.ps1` |
+| **3. Hear about it** | An email every Sunday, plus a check at every logon that emails you straight away if anything is broken | `Install-WeeklyCheck.ps1`, `Set-WeeklyCheckApiKey.ps1`, `Uninstall-WeeklyCheck.ps1` |
 
-Run all scripts from **your own account** in an **elevated** Windows PowerShell 5.1
-("Run as administrator"). Each script uses `%LOCALAPPDATA%` to find the Packages
-folder, so an elevated window opened by another admin account would point at the
-wrong profile. To run a script without changing your execution policy:
+`Repair-Permissions.ps1` and `Invoke-WeeklyCheck.ps1` are what the two scheduled
+tasks run; you don't run them yourself.
+
+## Before you start
+
+1. **Get the files.** On https://github.com/bobchomp/laptopsystemtrap click
+   **Code → Download ZIP** and extract it to a folder, e.g. `C:\PermissionTrap`.
+   To update later, download again and extract over the same folder.
+2. **Open PowerShell as administrator, as yourself.** Start → type *PowerShell* →
+   right-click **Windows PowerShell** → **Run as administrator** → **Yes**. If
+   Windows asks for another account's password, cancel: the scripts use *your*
+   `%LOCALAPPDATA%`, so they must run as you (`whoami` should show your account).
+3. **Go to the folder:** `cd C:\PermissionTrap`
+
+Every command below is run from that window. Each script is started with
+`powershell -ExecutionPolicy Bypass -File`, so you don't need to change
+Windows' script policy.
+
+## Quick start
 
 ```powershell
+# 1. Turn on auditing (once)
 powershell -ExecutionPolicy Bypass -File .\Enable-Auditing.ps1
+
+# 2. When an app breaks: find out what did it - BEFORE repairing anything
+powershell -ExecutionPolicy Bypass -File .\Get-PermissionReport.ps1
+
+# 3. Repair automatically from now on
+powershell -ExecutionPolicy Bypass -File .\Install-RepairTask.ps1 -WithAuditTrigger
+
+# 4. Weekly email (asks for your Resend API key - paste it with a RIGHT-CLICK)
+powershell -ExecutionPolicy Bypass -File .\Install-WeeklyCheck.ps1
 ```
 
-## Scripts
+Do step 3 after you've run the report at least once. Once the task fixes a
+folder, the report no longer lists it as broken, although the audit events still
+name the program that changed it.
 
-| Script | What it does |
-|---|---|
-| `Enable-Auditing.ps1` | Backs up the audit policy. Enables File System, Authorization Policy Change and Process Creation auditing (success only), with command lines in 4688 events. Raises the Security log to 128 MB (it never lowers it). Adds an audit rule (Everyone, ChangePermissions + TakeOwnership, inherited) to the Packages folder. Only the SACL is written; the script compares the DACL before and after to prove it was left alone. App folders that block inheritance get the rule added directly. It is safe to run again. |
-| `Disable-Auditing.ps1` | Removes the audit rule from the folders that got it. Restores the audit policy from the backup, puts the command-line registry value back as it was, and sets the Security log back to its old size. Logged events are kept. |
-| `Get-PermissionReport.ps1` | Run it when an app breaks. **Part 1** lists the folders that are missing SYSTEM or Administrators. **Part 2** checks that the auditing is still on and shows how far back the log goes. **Part 3** reads events 4670/4663 under Packages, groups them into bursts per process, and puts first the bursts that removed SYSTEM/Administrators or touched folders that are broken now. For each of those it walks the parent chain through 4688 events, with command lines, the publisher of each file and a hint (scheduled task / service / desktop). It changes nothing. Options: `-Hours 48` (only recent events), `-MaxEvents`. |
+## Part 1 — catch it
 
-### Part 2 — automatic repair
+### `Enable-Auditing.ps1`
+Turns on the auditing that records who changes permissions under Packages:
+- backs up the current audit policy first, so it can all be undone
+- enables **File System**, **Authorization Policy Change** and **Process
+  Creation** auditing (success only), with command lines in process events
+- raises the Security log to 128 MB, so evidence isn't overwritten (it never
+  lowers it)
+- adds an audit rule to the Packages folder that logs permission and ownership
+  changes; the folders' actual permissions are not touched (the script checks)
 
-| Script | What it does |
-|---|---|
-| `Install-RepairTask.ps1` | Registers the `PermissionTrap-Repair` scheduled task. It runs as SYSTEM with highest privileges at every logon. With `-WithAuditTrigger` it also runs 30 seconds after a permission-change audit event (4670); that needs `Enable-Auditing.ps1` to have been run. Your Packages path is worked out when you install and built into the task, because `%LOCALAPPDATA%` points at SYSTEM's own profile when running as SYSTEM. The repair script is copied into the admin-only `C:\ProgramData\PermissionTrap`, so nothing unelevated can change what SYSTEM runs. |
-| `Repair-Permissions.ps1` | What the task runs. It finds folders with no SYSTEM or Administrators entry and backs up their permissions (`icacls /save`, into `backups\<time>\<folder>.acl`). Then it grants only the missing ones, `(OI)(CI)F`, recursively for app folders. It **only adds**: no `/reset`, no `/remove`, and it doesn't change inheritance or the owner. Each fix goes to `repair.log`. After a fix it checks again 30 s later, in case the culprit is still working. A run that finds nothing broken changes nothing and logs nothing, so its own permission changes can't make it loop. |
-| `Uninstall-RepairTask.ps1` | Removes the task and the copied script. It keeps `repair.log` and the backups unless you pass `-RemoveLogsAndBackups`. Permissions it already repaired stay as they are. |
+Safe to run again. At the end, all three categories should show **Success**.
 
-### Weekly check — Sunday email, plus a check at every logon
+### `Get-PermissionReport.ps1`
+Run it when an app breaks. It changes nothing.
+- **Part 1:** folders missing SYSTEM or Administrators (works without admin).
+- **Part 2:** whether auditing is still on, and how far back the log goes.
+- **Part 3:** which processes changed permissions under Packages. Changes that
+  removed SYSTEM/Administrators, or touched folders that are broken now, come
+  first. For each one it shows:
+  - **`>>> WHAT DID IT:`** — the program responsible: the highest process in
+    the chain below Windows' own launchers (services, Task Scheduler, Explorer…),
+    with its publisher, and a hint such as *started by a scheduled task*
+  - the full chain of parent processes with their command lines
+  - the permissions before and after
 
-| Script | What it does |
-|---|---|
-| `Install-WeeklyCheck.ps1` | Registers `PermissionTrap-WeeklyCheck`. It runs as **you, not elevated**, every Sunday at 18:00 local time, and 2 minutes after every logon. It prompts for your Resend API key, with the input hidden, and stores it encrypted with DPAPI for your Windows account only (`weekly-resend.key`). The key is never written in plain text. Emails go from `info@rossmackenzie.co.uk` to `teddaharry@gmail.com`; change that with `-From` / `-To`. The installer needs an elevated window to write to `C:\ProgramData\PermissionTrap`, but run it from your own account. |
-| `Invoke-WeeklyCheck.ps1` | What the task runs. It does the same check as part 1 of the report and logs each run to `weekly.log`. **Sunday check** (or the first logon after a missed Sunday): it always emails, either the affected folders with an instruction to run `Get-PermissionReport.ps1` elevated, or "all clear" with how many weeks in a row it's been clear. If sending fails, it tries again at your next logon. **Logon check**: it emails only if something is broken; an all-clear is just logged. Finding problems resets the clear-weeks count. |
-| `Set-WeeklyCheckApiKey.ps1` | Changes the Resend API key without reinstalling. It prompts for the key (paste with a right-click) and checks it the same way the installer does. It stores the key encrypted, then sends you a test email to prove the key works. The test doesn't count as a weekly check. The installer uses this script to store the key too. |
-| `Uninstall-WeeklyCheck.ps1` | Removes the task, its script and settings, and the stored API key. It keeps `weekly.log` and the clear-weeks count unless you pass `-RemoveLogs`. |
+The report is saved in `C:\ProgramData\PermissionTrap\reports\`. The last lines
+print the command that copies it to the clipboard, so you can paste it.
 
-The task only runs while you're logged on: DPAPI can only decrypt your key while you're logged on.
+Options: `-Hours 48` looks only at recent events; `-MaxEvents` limits how many
+are read.
 
-**Pasting the key:** paste it with a **right-click**. In Windows PowerShell, Ctrl+V doesn't work in the hidden prompt: it types an invisible `^V` instead, which the installer now refuses. If `weekly.log` says the stored key contains invisible control characters, run `Set-WeeklyCheckApiKey.ps1` and paste with a right-click.
+Only changes made **after** you ran `Enable-Auditing.ps1` can be traced. A
+process that started before that shows as *start not in the log*; if it's still
+running, the report reads its details from the live process instead.
 
-To restore a folder's permissions from a backup:
+### `Disable-Auditing.ps1`
+Puts back everything Enable changed: the audit rule, the audit policy, the
+command-line setting and the log size. Events already logged are kept.
+
+## Part 2 — repair it
+
+### `Install-RepairTask.ps1 [-WithAuditTrigger]`
+Registers the **PermissionTrap-Repair** task. It runs as SYSTEM at every logon,
+and with `-WithAuditTrigger` also 30 seconds after any permission change is
+logged (needs Part 1's auditing).
+
+Each run:
+- finds folders missing SYSTEM or Administrators
+- backs up their permissions to `backups\<time>\<folder>.acl`
+- **adds** the missing entries — it never removes, resets or changes inheritance
+- writes each fix to `repair.log`
+- checks again 30 seconds later, in case the culprit is still working
+
+```powershell
+Start-ScheduledTask -TaskName PermissionTrap-Repair                     # repair now
+Get-Content C:\ProgramData\PermissionTrap\repair.log -Tail 20           # what it fixed
+```
+
+To undo one repair from its backup:
 `icacls "%LOCALAPPDATA%\Packages" /restore "C:\ProgramData\PermissionTrap\backups\<time>\<folder>.acl"`
+
+### `Uninstall-RepairTask.ps1 [-RemoveLogsAndBackups]`
+Removes the task. Repaired permissions stay as they are. `repair.log` and the
+backups are kept unless you add `-RemoveLogsAndBackups`.
+
+## Part 3 — hear about it
+
+### `Install-WeeklyCheck.ps1`
+Registers the **PermissionTrap-WeeklyCheck** task and stores your Resend API key.
+
+| When | What it emails |
+|---|---|
+| **Sunday 18:00** (local time, all year) | Always: either the broken folders, or *"all clear (N weeks in a row)"* |
+| **Every logon** (2 minutes after you sign in) | Only if something is broken. An all-clear is just logged. |
+| **First logon after a missed Sunday** (laptop was off) | Does the Sunday email instead |
+
+- Emails go **from** `info@rossmackenzie.co.uk` **to** `teddaharry@gmail.com`
+  (change with `-From` / `-To` when installing).
+- A problems email lists each folder and what it's missing, and tells you to
+  run `Get-PermissionReport.ps1` as administrator.
+- Finding a problem resets the *weeks in a row* count.
+- If an email can't be sent, that Sunday doesn't count and the next logon tries again.
+- The task runs as **you, not elevated**, and only while you're logged on: the
+  key is encrypted for your account and can only be unlocked while you're
+  signed in. You may see a window flash briefly when it runs.
+
+**Paste the API key with a right-click.** In Windows PowerShell, Ctrl+V doesn't
+work in the hidden prompt — it types an invisible `^V`, which the scripts refuse.
+The key is stored encrypted for your Windows account only, and never shown or
+saved in plain text.
+
+### Everyday commands
+
+```powershell
+# Run the check now (counts as the Sunday check if this week's hasn't happened yet)
+Start-ScheduledTask -TaskName PermissionTrap-WeeklyCheck
+
+# See what it did
+Get-Content C:\ProgramData\PermissionTrap\weekly.log -Tail 10
+
+# Change the API key - or press Enter at the prompt to keep it - and send a test email
+powershell -ExecutionPolicy Bypass -File .\Set-WeeklyCheckApiKey.ps1
+```
+
+`Set-WeeklyCheckApiKey.ps1` checks and stores the key, then sends a
+*"Permission Trap: test email"* to prove it works. The test doesn't affect the
+weekly schedule or the weeks-in-a-row count. No reinstall needed.
+
+### Reading `weekly.log`
+
+| Line starts with | Meaning |
+|---|---|
+| `WEEKLY CLEAR` | Sunday check, all fine, all-clear email sent |
+| `WEEKLY PROBLEMS` | Sunday check found broken folders, email sent |
+| `LOGON  CLEAR … not sent` | Logon check, all fine, no email (by design) |
+| `LOGON  PROBLEMS` | Logon check found broken folders, email sent |
+| `TEST` | Test email from `Set-WeeklyCheckApiKey.ps1` |
+| `ERROR` | Something failed — the rest of the line says what (see below) |
+
+### `Uninstall-WeeklyCheck.ps1 [-RemoveLogs]`
+Removes the task, its settings and the stored key. `weekly.log` and the
+weeks-in-a-row count are kept unless you add `-RemoveLogs`.
+
+## Undo everything
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Uninstall-WeeklyCheck.ps1
+powershell -ExecutionPolicy Bypass -File .\Uninstall-RepairTask.ps1
+powershell -ExecutionPolicy Bypass -File .\Disable-Auditing.ps1
+```
+
+## Troubleshooting
+
+| You see | Cause and fix |
+|---|---|
+| *"…contains a #requires statement for running as Administrator"* | The window isn't elevated. Open PowerShell with **Run as administrator**. |
+| *"Folder not found: …\Packages"* | The window is running as a different account. Check `whoami`; the scripts must run as you. |
+| *"running scripts is disabled on this system"* | Start the script with `powershell -ExecutionPolicy Bypass -File .\<script>.ps1`. |
+| Report: *"No permission changes … were found"* | The break happened before auditing was turned on, or the log has rolled over. Only later breaks can be traced. |
+| `weekly.log`: *"stored Resend API key contains invisible control characters"* | The key was pasted with Ctrl+V. Run `Set-WeeklyCheckApiKey.ps1` and paste with a **right-click**. |
+| `weekly.log`: *"Resend refused the email (HTTP …)"* | Resend rejected it; the message says why — usually a wrong key (`401`/`403`) or the sender domain not verified in Resend. |
+| `weekly.log`: *"Could not reach Resend"* | No internet at the time. A Sunday check is retried at the next logon. |
 
 ## Files
 
-`C:\ProgramData\PermissionTrap\` (SYSTEM and Administrators full control, Users read):
+Everything lives in `C:\ProgramData\PermissionTrap\`. Only SYSTEM and
+Administrators can change it; Users can read it. The exceptions are
+`weekly.log` and `weekly-state.json`, which your account can write (the weekly
+task runs unelevated), and `weekly-resend.key`, which only you, SYSTEM and
+Administrators can read.
 
-- `auditpol-backup.csv`: the audit policy as it was before you ran Enable
-- `audit-state.json`: the other "before" values, and the folders that got the audit rule
-- `reports\PermissionReport_<time>.txt`: each report run. If you run the report without elevation, it goes to `%TEMP%` instead.
-- `Repair-Permissions.ps1`: the copy the scheduled task runs
-- `repair.log`: every fix the task made (kept as `repair.log.1` once it passes 5 MB)
-- `backups\<time>\<folder>.acl`: each folder's permissions as they were before the task repaired it
-- `Invoke-WeeklyCheck.ps1`, `weekly-config.json`: the weekly check and its settings (admin-only)
-- `weekly-resend.key`: the Resend API key, DPAPI-encrypted for your account
-- `weekly.log`, `weekly-state.json`: one line per weekly run, and the clear-weeks count
+| File | What it is |
+|---|---|
+| `auditpol-backup.csv`, `audit-state.json` | The settings as they were before `Enable-Auditing.ps1`, for undoing it |
+| `reports\PermissionReport_<time>.txt` | Each report (in `%TEMP%` if you ran it without admin) |
+| `Repair-Permissions.ps1` | The copy the repair task runs |
+| `repair.log`, `backups\<time>\<folder>.acl` | Every repair, and the permissions from before it |
+| `Invoke-WeeklyCheck.ps1`, `weekly-config.json` | The copy the weekly task runs, and its sender/recipient |
+| `weekly-resend.key` | The Resend API key, encrypted for your account |
+| `weekly.log`, `weekly-state.json` | One line per weekly/logon check, and the weeks-in-a-row count |
 
-## Typical use
-
-1. Run `Enable-Auditing.ps1` once.
-2. Optional check: run `Get-PermissionReport.ps1` right away. Part 2 should show the three subcategories as "Success" and the audit rule as present.
-3. When an app breaks, run `Get-PermissionReport.ps1` before you repair anything, and send the report text.
-4. To repair automatically, run `Install-RepairTask.ps1 -WithAuditTrigger`. Do this after you've caught the culprit with the report: once the task fixes a folder, the report won't list it as broken any more, though the permission-change events still name the program.
-5. For a weekly email, run `Install-WeeklyCheck.ps1`, then `Start-ScheduledTask -TaskName PermissionTrap-WeeklyCheck` to send the first one now.
-6. To undo everything, run `Uninstall-WeeklyCheck.ps1`, `Uninstall-RepairTask.ps1`, then `Disable-Auditing.ps1`.
+`repair.log` and `weekly.log` roll over to `.log.1` at 5 MB.
 
 ## Tests
 
-`.github/workflows/test-part1.yml` runs parts 1 and 2 and the weekly check end to end on a Windows runner. For the weekly check it uses test mode (`-OutboxPath`), which writes each email to a file instead of sending it, and uploads the reports and logs as the `test-results` download.
-
-Only changes made **after** step 1 can be attributed. A process that started before
-auditing was on shows up as "start not in the log". If it is still running, the
-report reads its details from the live process instead.
+`.github/workflows/test-part1.yml` runs every part end to end on a Windows
+machine on each push: auditing and the report, the SYSTEM repair task
+(on demand and from the audit event), the weekly/logon emails, changing the
+API key, and every uninstaller. It never sends a real email — the weekly
+check is installed in test mode (`-OutboxPath`), which writes each email to a
+file instead. The reports, logs and test emails are uploaded as the
+`test-results` download on each run.

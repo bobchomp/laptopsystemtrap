@@ -103,7 +103,7 @@ Invoke-Icacls @($StateDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', 
 $setKey = Join-Path $PSScriptRoot 'Set-WeeklyCheckApiKey.ps1'
 if (-not (Test-Path -LiteralPath $setKey)) { throw "Set-WeeklyCheckApiKey.ps1 not found next to this script ($setKey)" }
 if ($ApiKey) { & $setKey -ApiKey $ApiKey -SkipTest }
-else         { & $setKey -KeepIfBlank -SkipTest }
+else         { & $setKey -SkipTest }
 
 # --- Script, config, log ------------------------------------------------------------
 

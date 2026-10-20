@@ -3,12 +3,13 @@
 <#
 .SYNOPSIS
     Changes the Resend API key used by the weekly check, then sends a test
-    email to prove it works. No need to uninstall or reinstall.
+    email to prove it works. No need to uninstall or reinstall. Press Enter
+    at the prompt instead to keep the stored key and just send the test.
 
 .DESCRIPTION
     - Prompts for the key (input hidden). Paste it with a RIGHT-CLICK: in
       Windows PowerShell, Ctrl+V does not paste into the hidden prompt, it
-      types an invisible ^V instead.
+      types an invisible ^V instead. Entering nothing keeps the stored key.
     - Trims stray spaces and line breaks, refuses keys containing invisible
       control characters (nothing is changed), and warns if the key does not
       start with re_.
@@ -26,9 +27,6 @@
 .PARAMETER ApiKey
     The key as a SecureString, for scripted use. If omitted you are prompted.
 
-.PARAMETER KeepIfBlank
-    If nothing is entered at the prompt and a key is already stored, keep it.
-
 .PARAMETER SkipTest
     Do not send the test email.
 
@@ -38,7 +36,6 @@
 [CmdletBinding()]
 param(
     [System.Security.SecureString]$ApiKey,
-    [switch]$KeepIfBlank,
     [switch]$SkipTest
 )
 
@@ -62,15 +59,14 @@ if (-not (Test-Path -LiteralPath $StateDir)) { throw "$StateDir not found - run 
 Write-Step 'Resend API key'
 if (-not $ApiKey) {
     Write-Host '   Paste with a RIGHT-CLICK (Ctrl+V does not work in this prompt), then press Enter.'
-    $prompt = if ($KeepIfBlank -and (Test-Path -LiteralPath $KeyFile)) { 'Resend API key (input hidden; just press Enter to keep the stored key)' }
+    $prompt = if (Test-Path -LiteralPath $KeyFile) { 'Resend API key (input hidden; just press Enter to keep the stored key)' }
               else { 'Resend API key (input hidden)' }
     $ApiKey = Read-Host -Prompt $prompt -AsSecureString
 }
 
 if ($ApiKey.Length -eq 0) {
-    if ($KeepIfBlank -and (Test-Path -LiteralPath $KeyFile)) {
+    if (Test-Path -LiteralPath $KeyFile) {
         Write-Ok "Keeping the key stored earlier in $KeyFile"
-        $SkipTest = $true
     } else {
         throw 'No API key entered. Nothing was changed.'
     }

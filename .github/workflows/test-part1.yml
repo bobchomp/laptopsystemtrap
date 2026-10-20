@@ -374,6 +374,15 @@ jobs:
           Assert-True ((Get-Content -LiteralPath $WeeklyLog -Tail 1) -match '\bTEST\s+email') 'weekly.log records the TEST email'
           Assert-True ((Get-Content -LiteralPath $WeeklyState -Raw) -eq $stateBefore) 'The test did not count as a weekly check (state unchanged)'
           Assert-True (Get-ScheduledTask -TaskName $WeeklyTask -ErrorAction SilentlyContinue) 'Task still installed (no reinstall needed)'
+
+          # Entering nothing keeps the stored key and still sends a test email.
+          $keyNow = Get-Content -LiteralPath $keyFile -Raw
+          $mailBefore = @(Get-ChildItem -LiteralPath $Outbox -Filter '*.json' | ForEach-Object { $_.FullName })
+          & .\Set-WeeklyCheckApiKey.ps1 -ApiKey (New-Object System.Security.SecureString) *> $null
+          Assert-True ((Get-Content -LiteralPath $keyFile -Raw) -eq $keyNow) 'Blank entry keeps the stored key'
+          $mails = @(Get-ChildItem -LiteralPath $Outbox -Filter '*.json' | Where-Object { $mailBefore -notcontains $_.FullName } |
+              ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+          Assert-True ($mails.Count -eq 1 -and $mails[0].email.subject -match 'test email' -and $mails[0].keyLength -eq $newKey.Length) "Blank entry still sends a test email with the stored key (got $($mails.Count))"
           Complete-Assertions
 
       - name: 11. Uninstall-WeeklyCheck.ps1
