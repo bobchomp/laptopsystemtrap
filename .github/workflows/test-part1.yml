@@ -198,7 +198,20 @@ jobs:
         run: |
           . .\tests\TestHelpers.ps1
           $testKey = 're_test_not_a_real_key_0123456789'
-          & .\Install-WeeklyCheck.ps1 -ApiKey (ConvertTo-SecureString $testKey -AsPlainText -Force) -OutboxPath $Outbox *>&1 |
+
+          # Ctrl+V in the hidden key prompt types an invisible ^V (0x16) instead of pasting.
+          # Such a key must be refused, with nothing saved or registered.
+          $refused = $null
+          try {
+              & .\Install-WeeklyCheck.ps1 -ApiKey (ConvertTo-SecureString ("re_test" + [char]0x16) -AsPlainText -Force) -OutboxPath $Outbox *> $null
+          } catch { $refused = $_.Exception.Message }
+          Write-Host "Installer with a ^V key: $refused"
+          Assert-True ($refused -match 'control characters' -and $refused -match 'right-click') 'A key containing ^V (Ctrl+V) is refused, with the right-click advice'
+          Assert-True (-not (Test-Path -LiteralPath (Join-Path $StateDir 'weekly-resend.key'))) 'Nothing saved for the refused key'
+          Assert-True (-not (Get-ScheduledTask -TaskName $WeeklyTask -ErrorAction SilentlyContinue)) 'No task registered for the refused key'
+
+          # Stray spaces and a line break around a pasted key are trimmed (checked by the decrypt test below).
+          & .\Install-WeeklyCheck.ps1 -ApiKey (ConvertTo-SecureString "  $testKey`r`n" -AsPlainText -Force) -OutboxPath $Outbox *>&1 |
               Tee-Object -FilePath (Join-Path $ArtifactDir 'install-weekly-output.txt')
           $out  = Get-Content -LiteralPath (Join-Path $ArtifactDir 'install-weekly-output.txt')
           $task = Get-ScheduledTask -TaskName $WeeklyTask -ErrorAction SilentlyContinue
@@ -225,7 +238,7 @@ jobs:
           Assert-True ($stored -notmatch [regex]::Escape($testKey)) 'API key is not stored in plain text'
           $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(($stored | ConvertTo-SecureString))
           $decrypted = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-          Assert-True ($decrypted -eq $testKey) 'API key decrypts with DPAPI for this user'
+          Assert-True ($decrypted -eq $testKey) 'API key decrypts with DPAPI for this user, without the stray spaces/line break'
           $readers = Get-OtherAccess $keyFile 'ReadData' 'S-1-5-18', 'S-1-5-32-544', $me.User.Value
           Assert-True ($readers.Count -eq 0) "Only this user, SYSTEM and Administrators can read the key file (others: $($readers -join '; '))"
           Assert-True (-not ($out -match [regex]::Escape($testKey))) 'Installer never printed the key'
@@ -305,6 +318,18 @@ jobs:
           Set-WeeklyLastCheckDaysAgo 8
           $r = Invoke-WeeklyTaskRun
           Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.subject -match '\(1 week in a row\)') "g) count restarted at 1 week (got '$($r.Emails.email.subject)')"
+
+          Write-Host '--- h) A key saved by the old installer with a ^V in it -> clear error, no email'
+          $keyFile = Join-Path $StateDir 'weekly-resend.key'
+          $goodKey = Get-Content -LiteralPath $keyFile -Raw
+          ConvertFrom-SecureString (ConvertTo-SecureString ("re_test" + [char]0x16) -AsPlainText -Force) | Set-Content -LiteralPath $keyFile -Encoding ASCII
+          Set-WeeklyLastCheckDaysAgo 8
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.ExitCode -ne 0) "h) task run reports failure (exit $($r.ExitCode))"
+          Assert-True ($r.Log -match 'ERROR\s.*stored Resend API key contains invisible control characters.*right-click') 'h) weekly.log explains the bad stored key and how to fix it'
+          Assert-True ($r.Log -notmatch 'Resend refused') 'h) does not blame Resend for a local problem'
+          Assert-True ($r.Emails.Count -eq 0) "h) no email (got $($r.Emails.Count))"
+          Set-Content -LiteralPath $keyFile -Value $goodKey.Trim() -Encoding ASCII
           Complete-Assertions
 
       - name: 10. Uninstall-WeeklyCheck.ps1

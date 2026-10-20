@@ -100,11 +100,29 @@ Invoke-Icacls @($StateDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', 
 
 Write-Step 'Resend API key'
 if (-not $ApiKey) {
-    $prompt = if (Test-Path -LiteralPath $KeyFile) { 'Paste your Resend API key (input hidden; press Enter to keep the stored key)' }
-              else { 'Paste your Resend API key (input hidden)' }
+    # In Windows PowerShell, Ctrl+V does not paste into this hidden prompt: it
+    # types an invisible ^V character instead. Right-click pastes properly.
+    Write-Host '   Paste with a RIGHT-CLICK (Ctrl+V does not work in this prompt), then press Enter.'
+    $prompt = if (Test-Path -LiteralPath $KeyFile) { 'Resend API key (input hidden; just press Enter to keep the stored key)' }
+              else { 'Resend API key (input hidden)' }
     $ApiKey = Read-Host -Prompt $prompt -AsSecureString
 }
 if ($ApiKey.Length -gt 0) {
+    # Check what was entered without ever showing it: drop stray spaces/line
+    # breaks around it, and refuse invisible control characters (such as the
+    # ^V that Ctrl+V types), which Windows will not put in a web request.
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiKey)
+    try     { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr).Trim() }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    if ($plain -match '[\x00-\x1F\x7F]') {
+        throw ('The key you entered contains invisible control characters (Ctrl+V types one instead of pasting). ' +
+               'Nothing was saved. Run the installer again and paste the key with a right-click.')
+    }
+    if (-not $plain) { throw 'The key you entered was blank. Nothing was saved.' }
+    if ($plain -notmatch '^re_') { Write-Warn "That doesn't look like a Resend API key (they start with 're_'). Saving it anyway." }
+    $ApiKey = ConvertTo-SecureString -String $plain -AsPlainText -Force
+    Remove-Variable plain
+
     # ConvertFrom-SecureString without -Key encrypts with DPAPI, CurrentUser
     # scope: only this Windows account (on this PC) can decrypt it.
     $encrypted = ConvertFrom-SecureString -SecureString $ApiKey

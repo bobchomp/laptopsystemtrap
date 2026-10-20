@@ -42,6 +42,8 @@ powershell -ExecutionPolicy Bypass -File .\Enable-Auditing.ps1
 
 The task only runs while you're logged on: DPAPI can only decrypt your key while you're logged on.
 
+**Pasting the key:** paste it with a **right-click**. In Windows PowerShell, Ctrl+V doesn't work in the hidden prompt: it types an invisible `^V` instead, which the installer now refuses. If `weekly.log` says the stored key contains invisible control characters, run `Install-WeeklyCheck.ps1` again and paste with a right-click.
+
 To restore a folder's permissions from a backup:
 `icacls "%LOCALAPPDATA%\Packages" /restore "C:\ProgramData\PermissionTrap\backups\<time>\<folder>.acl"`
 

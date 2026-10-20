@@ -110,8 +110,15 @@ function Get-ApiKey {
     # Trim: the file ends with a newline, which ConvertTo-SecureString rejects.
     $secure = (Get-Content -LiteralPath $KeyFile -Raw).Trim() | ConvertTo-SecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-    try     { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    try     { $key = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr).Trim() }
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    # Windows refuses to put control characters in a web request header. Keys
+    # saved by older installers could contain one (Ctrl+V in the hidden prompt).
+    if ($key -match '[\x00-\x1F\x7F]') {
+        throw ('The stored Resend API key contains invisible control characters, so no email was sent. ' +
+               'Run Install-WeeklyCheck.ps1 again and paste the key with a right-click (Ctrl+V does not work in that prompt).')
+    }
+    $key
 }
 
 function New-Email($Config, $Result, [int]$Streak, [bool]$Weekly) {
@@ -171,9 +178,14 @@ function Send-Email($Config, $Email) {
             -Headers @{ Authorization = "Bearer $key" } -ContentType 'application/json; charset=utf-8' `
             -Body ([System.Text.Encoding]::UTF8.GetBytes($json))
     } catch {
-        # Resend explains problems (bad key, unverified domain) in the response body.
-        $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-        throw "Resend refused the email: $detail"
+        # Only say "Resend refused" when Resend actually answered (bad key, unverified
+        # domain - it explains in the response body). Otherwise the request never got
+        # there: no network, DNS, a proxy, and so on.
+        if ($_.Exception.Response) {
+            $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+            throw "Resend refused the email (HTTP $([int]$_.Exception.Response.StatusCode)): $detail"
+        }
+        throw "Could not reach Resend: $($_.Exception.Message)"
     }
     "sent (Resend id $($response.id))"
 }
