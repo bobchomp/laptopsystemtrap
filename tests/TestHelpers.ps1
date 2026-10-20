@@ -7,6 +7,11 @@ $RepairFolderA = Join-Path $PackagesPath 'PermissionTrap.RepairTestA'   # part 2
 $RepairFolderB = Join-Path $PackagesPath 'PermissionTrap.RepairTestB'   # part 2: repaired by the audit-event trigger
 $RepairTask   = 'PermissionTrap-Repair'
 $RepairLog    = Join-Path $env:ProgramData 'PermissionTrap\repair.log'
+$WeeklyFolder = Join-Path $PackagesPath 'PermissionTrap.WeeklyTestC'    # weekly check: must be reported
+$WeeklyTask   = 'PermissionTrap-WeeklyCheck'
+$WeeklyLog    = Join-Path $env:ProgramData 'PermissionTrap\weekly.log'
+$WeeklyState  = Join-Path $env:ProgramData 'PermissionTrap\weekly-state.json'
+$Outbox       = Join-Path $env:RUNNER_TEMP 'part1-artifacts\outbox'     # test mode: emails land here, not sent
 $StateDir     = Join-Path $env:ProgramData 'PermissionTrap'
 $ArtifactDir  = Join-Path $env:RUNNER_TEMP 'part1-artifacts'
 $BeforeFile   = Join-Path $ArtifactDir 'snapshot-before.json'
@@ -123,4 +128,45 @@ function Assert-Repaired([string]$Path) {
 
     $logged = (Test-Path -LiteralPath $RepairLog) -and (Select-String -LiteralPath $RepairLog -Pattern "FIXED\s+$([regex]::Escape($name))\s" -Quiet)
     Assert-True $logged "repair.log records the fix for $name"
+}
+
+# Accounts other than $AllowedSids that are granted any of $Rights on a file.
+function Get-OtherAccess([string]$Path, [System.Security.AccessControl.FileSystemRights]$Rights, [string[]]$AllowedSids) {
+    @((Get-Acl -LiteralPath $Path).Access | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $Rights) -and
+        $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -notin $AllowedSids
+    } | ForEach-Object { "$($_.IdentityReference): $($_.FileSystemRights)" })
+}
+# Only the bits that allow changing a file (Modify/FullControl also contain read bits).
+$WriteRights = [System.Security.AccessControl.FileSystemRights]'Write, Delete, ChangePermissions, TakeOwnership'
+
+# Starts the weekly-check task, waits for the run to finish and returns what it
+# did: the new weekly.log line(s), the task's exit code and any new outbox emails.
+function Invoke-WeeklyTaskRun {
+    $logBefore  = @(Get-Content -LiteralPath $WeeklyLog -ErrorAction SilentlyContinue).Count
+    $mailBefore = @(Get-ChildItem -LiteralPath $Outbox -Filter '*.json' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    Start-ScheduledTask -TaskName $WeeklyTask
+    $finished = Wait-Until 120 {
+        @(Get-Content -LiteralPath $WeeklyLog -ErrorAction SilentlyContinue).Count -gt $logBefore -and
+        (Get-ScheduledTask -TaskName $WeeklyTask).State -ne 'Running'
+    }
+    $log    = (@(Get-Content -LiteralPath $WeeklyLog -ErrorAction SilentlyContinue) | Select-Object -Skip $logBefore) -join "`n"
+    $emails = @(Get-ChildItem -LiteralPath $Outbox -Filter '*.json' -ErrorAction SilentlyContinue |
+        Where-Object { $mailBefore -notcontains $_.FullName } | Sort-Object Name |
+        ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+    Write-Host "weekly.log: $log"
+    foreach ($e in $emails) { Write-Host "email: $($e.email.subject)" }
+    [pscustomobject]@{
+        Finished = $finished
+        ExitCode = (Get-ScheduledTaskInfo -TaskName $WeeklyTask).LastTaskResult
+        Log      = $log
+        Emails   = $emails
+    }
+}
+
+# Pretends the last weekly check was $Days days ago, so the next run is due.
+function Set-WeeklyLastCheckDaysAgo([int]$Days) {
+    $state = Get-Content -LiteralPath $WeeklyState -Raw | ConvertFrom-Json
+    $state.lastCheck = (Get-Date).AddDays(-$Days).ToString('o')
+    $state | ConvertTo-Json | Set-Content -LiteralPath $WeeklyState -Encoding UTF8
 }

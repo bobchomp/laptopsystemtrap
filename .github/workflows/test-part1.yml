@@ -3,9 +3,11 @@
 #         Get-PermissionReport must catch it.
 # Part 2: Install-RepairTask -> strip folders -> the SYSTEM task must repair them,
 #         on demand and from the audit event -> Uninstall-RepairTask.
+# Weekly: Install-WeeklyCheck (test mode: emails written to files, not sent) ->
+#         clear / skip / streak / problems runs of the task -> Uninstall-WeeklyCheck.
 # Finally Disable-Auditing must restore everything.
 # The runner is elevated, so the scripts run as they would from an admin prompt.
-name: Test parts 1 and 2
+name: Test parts 1 and 2 + weekly check
 
 on:
   push:
@@ -22,7 +24,7 @@ permissions:
 jobs:
   test-part1:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         shell: powershell   # Windows PowerShell 5.1, same as on the laptop
@@ -144,12 +146,7 @@ jobs:
           # The task runs as SYSTEM, so ordinary users must not be able to change the script it runs.
           $script = Join-Path $StateDir 'Repair-Permissions.ps1'
           Assert-True (Test-Path -LiteralPath $script) 'Repair script copied to C:\ProgramData\PermissionTrap'
-          # Only the bits that allow changing the file (Modify/FullControl also contain read bits).
-          $write = [System.Security.AccessControl.FileSystemRights]'Write, Delete, ChangePermissions, TakeOwnership'
-          $writers = @((Get-Acl -LiteralPath $script).Access | Where-Object {
-              $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band $write) -and
-              $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -notin 'S-1-5-18', 'S-1-5-32-544'
-          } | ForEach-Object { "$($_.IdentityReference): $($_.FileSystemRights)" })
+          $writers = Get-OtherAccess $script $WriteRights 'S-1-5-18', 'S-1-5-32-544'
           Assert-True ($writers.Count -eq 0) "Only SYSTEM and Administrators can change the repair script (others: $($writers -join '; '))"
           Assert-True (-not ($out -match '\bWARN\b')) 'Install-RepairTask.ps1 printed no warnings'
           Complete-Assertions
@@ -195,7 +192,121 @@ jobs:
           Assert-True (Test-Path -LiteralPath $RepairLog) 'repair.log kept by default'
           Complete-Assertions
 
-      - name: 8. Disable-Auditing.ps1
+      - name: 8. Install-WeeklyCheck.ps1 (test mode)
+        id: weekly_install
+        if: ${{ !cancelled() }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          $testKey = 're_test_not_a_real_key_0123456789'
+          & .\Install-WeeklyCheck.ps1 -ApiKey (ConvertTo-SecureString $testKey -AsPlainText -Force) -OutboxPath $Outbox *>&1 |
+              Tee-Object -FilePath (Join-Path $ArtifactDir 'install-weekly-output.txt')
+          $out  = Get-Content -LiteralPath (Join-Path $ArtifactDir 'install-weekly-output.txt')
+          $task = Get-ScheduledTask -TaskName $WeeklyTask -ErrorAction SilentlyContinue
+          Assert-True $task "Scheduled task '$WeeklyTask' is registered"
+          if (-not $task) { Complete-Assertions }
+          Export-ScheduledTask -TaskName $WeeklyTask | Set-Content -LiteralPath (Join-Path $ArtifactDir 'weekly-task.xml')
+
+          $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          Assert-True ($task.Principal.UserId -like "*$env:USERNAME") "Task runs as the installing user (got '$($task.Principal.UserId)')"
+          Assert-True ($task.Principal.RunLevel -eq 'Limited') "Task is not elevated (got '$($task.Principal.RunLevel)')"
+          Assert-True ($task.Principal.LogonType -eq 'Interactive') "Task runs only while the user is logged on (got '$($task.Principal.LogonType)')"
+          $weekly = $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' }
+          Assert-True ($weekly -and $weekly.DaysOfWeek -eq 1 -and $weekly.StartBoundary -match 'T18:00:00') "Weekly trigger on Sunday 18:00 (got days=$($weekly.DaysOfWeek) start=$($weekly.StartBoundary))"
+          $logon = $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }
+          Assert-True $logon 'Logon trigger (to catch up a missed Sunday)'
+          Assert-True $task.Settings.StartWhenAvailable 'Runs as soon as possible after a missed start'
+
+          # The key: stored, encrypted (never plain text), only this user can decrypt and read it.
+          $keyFile = Join-Path $StateDir 'weekly-resend.key'
+          Assert-True (Test-Path -LiteralPath $keyFile) 'API key file written'
+          $stored = Get-Content -LiteralPath $keyFile -Raw
+          Assert-True ($stored -notmatch [regex]::Escape($testKey)) 'API key is not stored in plain text'
+          $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(($stored | ConvertTo-SecureString))
+          $decrypted = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+          Assert-True ($decrypted -eq $testKey) 'API key decrypts with DPAPI for this user'
+          $readers = Get-OtherAccess $keyFile 'ReadData' 'S-1-5-18', 'S-1-5-32-544', $me.User.Value
+          Assert-True ($readers.Count -eq 0) "Only this user, SYSTEM and Administrators can read the key file (others: $($readers -join '; '))"
+          Assert-True (-not ($out -match [regex]::Escape($testKey))) 'Installer never printed the key'
+
+          $config = Get-Content -LiteralPath (Join-Path $StateDir 'weekly-config.json') -Raw | ConvertFrom-Json
+          Assert-True (@($config.to) -contains 'teddaharry@gmail.com' -and @($config.to).Count -eq 1) "Recipient is teddaharry@gmail.com (got $($config.to -join ', '))"
+          Assert-True ($config.from -like '*<info@rossmackenzie.co.uk>') "Sender is info@rossmackenzie.co.uk (got $($config.from))"
+          Assert-True ($config.packagesPath -eq $PackagesPath) "Packages path built in (got $($config.packagesPath))"
+          foreach ($f in 'Invoke-WeeklyCheck.ps1', 'weekly-config.json') {
+              $writers = Get-OtherAccess (Join-Path $StateDir $f) $WriteRights 'S-1-5-18', 'S-1-5-32-544'
+              Assert-True ($writers.Count -eq 0) "Only SYSTEM and Administrators can change $f (others: $($writers -join '; '))"
+          }
+          Assert-True (-not ($out -match '\bWARN\b' -notmatch 'TEST MODE')) 'Installer printed no warnings apart from test mode'
+          Complete-Assertions
+
+      - name: 9. Weekly check runs (clear, skip, streak, problems)
+        if: ${{ !cancelled() && steps.weekly_install.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          # Earlier tests' folders may still be broken if a part 2 step failed; start clean.
+          foreach ($f in $TestFolder, $RepairFolderA, $RepairFolderB, $WeeklyFolder) {
+              if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Recurse -Force }
+          }
+
+          Write-Host '--- a) First run: never checked, so due -> all clear, 1 week'
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.Finished -and $r.ExitCode -eq 0) "a) task run finished with exit code 0 (got $($r.ExitCode))"
+          Assert-True ($r.Log -match 'CLEAR\s.*\b1 week\(s\) in a row') 'a) weekly.log records CLEAR, 1 week'
+          Assert-True ($r.Emails.Count -eq 1) "a) one email (got $($r.Emails.Count))"
+          if ($r.Emails.Count) {
+              $e = $r.Emails[0]
+              Assert-True (@($e.email.to) -contains 'teddaharry@gmail.com') 'a) email to teddaharry@gmail.com'
+              Assert-True ($e.email.from -like '*<info@rossmackenzie.co.uk>') 'a) email from info@rossmackenzie.co.uk'
+              Assert-True ($e.email.subject -match 'all clear' -and $e.email.subject -match '\(1 week in a row\)') "a) subject says all clear, 1 week (got '$($e.email.subject)')"
+              Assert-True ($e.keyLength -eq 're_test_not_a_real_key_0123456789'.Length) 'a) the task (running as the user) decrypted the API key'
+          }
+
+          Write-Host '--- b) Again in the same week -> SKIP, no email'
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.ExitCode -eq 0 -and $r.Log -match '\bSKIP\b') 'b) second run this week is skipped'
+          Assert-True ($r.Emails.Count -eq 0) "b) no email (got $($r.Emails.Count))"
+
+          Write-Host '--- c) A week later -> all clear, 2 weeks'
+          Set-WeeklyLastCheckDaysAgo 8
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.subject -match '\(2 weeks in a row\)') "c) subject says 2 weeks in a row (got '$($r.Emails.email.subject)')"
+
+          Write-Host '--- d) A folder loses SYSTEM/Administrators -> problems email'
+          New-StrippedTestFolder $WeeklyFolder
+          Set-WeeklyLastCheckDaysAgo 8
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.ExitCode -eq 0 -and $r.Log -match 'PROBLEMS\s.*PermissionTrap\.WeeklyTestC') 'd) weekly.log records PROBLEMS with the folder'
+          Assert-True ($r.Emails.Count -eq 1) "d) one email (got $($r.Emails.Count))"
+          if ($r.Emails.Count) {
+              $m = $r.Emails[0].email
+              Assert-True ($m.subject -match '1 folder\(s\) missing SYSTEM/Administrators') "d) subject reports 1 folder (got '$($m.subject)')"
+              Assert-True ($m.text -match 'PermissionTrap\.WeeklyTestC - missing SYSTEM and Administrators') 'd) text lists the folder and what is missing'
+              Assert-True ($m.text -match 'Get-PermissionReport\.ps1' -and $m.text -match 'as administrator') 'd) text says to run Get-PermissionReport.ps1 elevated'
+              Assert-True ($m.html -match 'PermissionTrap\.WeeklyTestC') 'd) HTML version lists the folder too'
+          }
+          $state = Get-Content -LiteralPath $WeeklyState -Raw | ConvertFrom-Json
+          Assert-True ($state.clearStreak -eq 0) "d) clear streak reset to 0 (got $($state.clearStreak))"
+
+          Write-Host '--- e) Fixed, next week -> all clear, streak starts again at 1'
+          Remove-Item -LiteralPath $WeeklyFolder -Recurse -Force
+          Set-WeeklyLastCheckDaysAgo 8
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.subject -match '\(1 week in a row\)') "e) streak restarted at 1 week (got '$($r.Emails.email.subject)')"
+          Complete-Assertions
+
+      - name: 10. Uninstall-WeeklyCheck.ps1
+        if: ${{ !cancelled() && steps.weekly_install.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          & .\Uninstall-WeeklyCheck.ps1 *>&1 | Tee-Object -FilePath (Join-Path $ArtifactDir 'uninstall-weekly-output.txt')
+          Assert-True (-not (Get-ScheduledTask -TaskName $WeeklyTask -ErrorAction SilentlyContinue)) "Scheduled task '$WeeklyTask' is gone"
+          foreach ($f in 'weekly-resend.key', 'Invoke-WeeklyCheck.ps1', 'weekly-config.json') {
+              Assert-True (-not (Test-Path -LiteralPath (Join-Path $StateDir $f))) "$f removed"
+          }
+          Assert-True (Test-Path -LiteralPath $WeeklyLog) 'weekly.log kept by default'
+          Complete-Assertions
+
+      - name: 11. Disable-Auditing.ps1
         if: ${{ !cancelled() && steps.enable.conclusion == 'success' }}
         run: |
           . .\tests\TestHelpers.ps1
@@ -226,7 +337,7 @@ jobs:
           & wevtutil.exe epl Security (Join-Path $ArtifactDir 'security-events.evtx') '/q:*[System[(EventID=4663 or EventID=4670 or EventID=4688)]]'
           Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4670, 4663 } -ErrorAction SilentlyContinue |
               Format-List TimeCreated, Id, Message | Out-File (Join-Path $ArtifactDir 'security-4670-4663.txt') -Width 300
-          foreach ($f in $TestFolder, $RepairFolderA, $RepairFolderB) {
+          foreach ($f in $TestFolder, $RepairFolderA, $RepairFolderB, $WeeklyFolder) {
               if (-not (Test-Path -LiteralPath $f)) { continue }
               & icacls.exe $f > (Join-Path $ArtifactDir "$(Split-Path $f -Leaf)-acl-final.txt")
               Remove-Item -LiteralPath $f -Recurse -Force -ErrorAction SilentlyContinue
