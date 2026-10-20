@@ -38,11 +38,12 @@ powershell -ExecutionPolicy Bypass -File .\Enable-Auditing.ps1
 |---|---|
 | `Install-WeeklyCheck.ps1` | Registers `PermissionTrap-WeeklyCheck`. It runs as **you, not elevated**, every Sunday at 18:00 local time, and 2 minutes after every logon. It prompts for your Resend API key, with the input hidden, and stores it encrypted with DPAPI for your Windows account only (`weekly-resend.key`). The key is never written in plain text. Emails go from `info@rossmackenzie.co.uk` to `teddaharry@gmail.com`; change that with `-From` / `-To`. The installer needs an elevated window to write to `C:\ProgramData\PermissionTrap`, but run it from your own account. |
 | `Invoke-WeeklyCheck.ps1` | What the task runs. It does the same check as part 1 of the report and logs each run to `weekly.log`. **Sunday check** (or the first logon after a missed Sunday): it always emails, either the affected folders with an instruction to run `Get-PermissionReport.ps1` elevated, or "all clear" with how many weeks in a row it's been clear. If sending fails, it tries again at your next logon. **Logon check**: it emails only if something is broken; an all-clear is just logged. Finding problems resets the clear-weeks count. |
+| `Set-WeeklyCheckApiKey.ps1` | Changes the Resend API key without reinstalling. It prompts for the key (paste with a right-click) and checks it the same way the installer does. It stores the key encrypted, then sends you a test email to prove the key works. The test doesn't count as a weekly check. The installer uses this script to store the key too. |
 | `Uninstall-WeeklyCheck.ps1` | Removes the task, its script and settings, and the stored API key. It keeps `weekly.log` and the clear-weeks count unless you pass `-RemoveLogs`. |
 
 The task only runs while you're logged on: DPAPI can only decrypt your key while you're logged on.
 
-**Pasting the key:** paste it with a **right-click**. In Windows PowerShell, Ctrl+V doesn't work in the hidden prompt: it types an invisible `^V` instead, which the installer now refuses. If `weekly.log` says the stored key contains invisible control characters, run `Install-WeeklyCheck.ps1` again and paste with a right-click.
+**Pasting the key:** paste it with a **right-click**. In Windows PowerShell, Ctrl+V doesn't work in the hidden prompt: it types an invisible `^V` instead, which the installer now refuses. If `weekly.log` says the stored key contains invisible control characters, run `Set-WeeklyCheckApiKey.ps1` and paste with a right-click.
 
 To restore a folder's permissions from a backup:
 `icacls "%LOCALAPPDATA%\Packages" /restore "C:\ProgramData\PermissionTrap\backups\<time>\<folder>.acl"`

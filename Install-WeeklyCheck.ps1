@@ -9,10 +9,11 @@
     at your next logon instead.
 
 .DESCRIPTION
-    - Prompts for your Resend API key (input hidden) and stores it encrypted
-      with DPAPI for YOUR Windows account only (CurrentUser scope) in
-      C:\ProgramData\PermissionTrap\weekly-resend.key. It is never written in
-      plain text and never shown.
+    - Prompts for your Resend API key (input hidden; paste with a right-click)
+      and stores it encrypted with DPAPI for YOUR Windows account only
+      (CurrentUser scope) in C:\ProgramData\PermissionTrap\weekly-resend.key,
+      using Set-WeeklyCheckApiKey.ps1. It is never written in plain text and
+      never shown. To change the key later, run Set-WeeklyCheckApiKey.ps1.
     - Copies Invoke-WeeklyCheck.ps1 and writes weekly-config.json (Packages
       path, sender, recipient) into C:\ProgramData\PermissionTrap, where only
       administrators can change them.
@@ -61,7 +62,6 @@ $StateDir     = Join-Path $env:ProgramData 'PermissionTrap'
 $SourceScript = Join-Path $PSScriptRoot 'Invoke-WeeklyCheck.ps1'
 $TargetScript = Join-Path $StateDir 'Invoke-WeeklyCheck.ps1'
 $ConfigFile   = Join-Path $StateDir 'weekly-config.json'
-$KeyFile      = Join-Path $StateDir 'weekly-resend.key'
 $StateFile    = Join-Path $StateDir 'weekly-state.json'
 $LogFile      = Join-Path $StateDir 'weekly.log'
 
@@ -98,43 +98,12 @@ Invoke-Icacls @($StateDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', 
 
 # --- API key ------------------------------------------------------------------------
 
-Write-Step 'Resend API key'
-if (-not $ApiKey) {
-    # In Windows PowerShell, Ctrl+V does not paste into this hidden prompt: it
-    # types an invisible ^V character instead. Right-click pastes properly.
-    Write-Host '   Paste with a RIGHT-CLICK (Ctrl+V does not work in this prompt), then press Enter.'
-    $prompt = if (Test-Path -LiteralPath $KeyFile) { 'Resend API key (input hidden; just press Enter to keep the stored key)' }
-              else { 'Resend API key (input hidden)' }
-    $ApiKey = Read-Host -Prompt $prompt -AsSecureString
-}
-if ($ApiKey.Length -gt 0) {
-    # Check what was entered without ever showing it: drop stray spaces/line
-    # breaks around it, and refuse invisible control characters (such as the
-    # ^V that Ctrl+V types), which Windows will not put in a web request.
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiKey)
-    try     { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr).Trim() }
-    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-    if ($plain -match '[\x00-\x1F\x7F]') {
-        throw ('The key you entered contains invisible control characters (Ctrl+V types one instead of pasting). ' +
-               'Nothing was saved. Run the installer again and paste the key with a right-click.')
-    }
-    if (-not $plain) { throw 'The key you entered was blank. Nothing was saved.' }
-    if ($plain -notmatch '^re_') { Write-Warn "That doesn't look like a Resend API key (they start with 're_'). Saving it anyway." }
-    $ApiKey = ConvertTo-SecureString -String $plain -AsPlainText -Force
-    Remove-Variable plain
-
-    # ConvertFrom-SecureString without -Key encrypts with DPAPI, CurrentUser
-    # scope: only this Windows account (on this PC) can decrypt it.
-    $encrypted = ConvertFrom-SecureString -SecureString $ApiKey
-    Set-Content -LiteralPath $KeyFile -Value $encrypted -Encoding ASCII
-    # Readable only by you (to decrypt) and SYSTEM/Administrators (to manage it).
-    Invoke-Icacls @($KeyFile, '/inheritance:r', '/grant:r', "*${MeSid}:R", '*S-1-5-18:F', '*S-1-5-32-544:F')
-    Write-Ok "Stored encrypted (DPAPI, CurrentUser) in $KeyFile"
-} elseif (Test-Path -LiteralPath $KeyFile) {
-    Write-Ok "Keeping the key stored earlier in $KeyFile"
-} else {
-    throw 'No API key entered.'
-}
+# Set-WeeklyCheckApiKey.ps1 does the prompting, checking and encrypting; it is
+# also what you run later to change the key without reinstalling.
+$setKey = Join-Path $PSScriptRoot 'Set-WeeklyCheckApiKey.ps1'
+if (-not (Test-Path -LiteralPath $setKey)) { throw "Set-WeeklyCheckApiKey.ps1 not found next to this script ($setKey)" }
+if ($ApiKey) { & $setKey -ApiKey $ApiKey -SkipTest }
+else         { & $setKey -KeepIfBlank -SkipTest }
 
 # --- Script, config, log ------------------------------------------------------------
 
@@ -187,5 +156,6 @@ Write-Ok 'Registered: Sundays 18:00 (always emails) and every logon (emails only
 Write-Host ''
 Write-Host 'Done.' -ForegroundColor Green
 Write-Host "Send the first check now:  Start-ScheduledTask -TaskName $TaskName"
+Write-Host 'Change the API key:        .\Set-WeeklyCheckApiKey.ps1'
 Write-Host "See what it did:           Get-Content '$LogFile' -Tail 10"
 Write-Host 'Remove it:                 .\Uninstall-WeeklyCheck.ps1'

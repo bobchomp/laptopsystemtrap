@@ -27,10 +27,15 @@
 
 .PARAMETER Force
     Treat this run as the weekly one even if this week's was already done.
+
+.PARAMETER TestEmail
+    Only send a short test email (used by Set-WeeklyCheckApiKey.ps1). Does not
+    check folders or count as a weekly check.
 #>
 [CmdletBinding()]
 param(
-    [switch]$Force
+    [switch]$Force,
+    [switch]$TestEmail
 )
 
 $ErrorActionPreference = 'Stop'
@@ -201,7 +206,15 @@ try {
               elseif ($state.lastCheck)         { [datetime]::Parse($state.lastCheck, $null, 'RoundtripKind') }
               else                              { $null }
 
-    if (-not (Test-Path -LiteralPath $config.packagesPath -PathType Container)) {
+    if ($TestEmail) {
+        $text = "This is a test from Permission Trap on $env:COMPUTERNAME. The Resend API key works; weekly checks will be emailed to this address."
+        $email = [ordered]@{
+            from = $config.from; to = @($config.to)
+            subject = "Permission Trap: test email from $env:COMPUTERNAME"
+            text = $text; html = "<p>$([System.Net.WebUtility]::HtmlEncode($text))</p>"
+        }
+        Write-Log "TEST     email $(Send-Email $config $email)"
+    } elseif (-not (Test-Path -LiteralPath $config.packagesPath -PathType Container)) {
         Write-Log "ERROR    Packages folder not found: $($config.packagesPath)"
         $exitCode = 1
     } else {
@@ -237,7 +250,8 @@ try {
         }
     }
 } catch {
-    Write-Log "ERROR    $($_.Exception.Message)  (a weekly check is not counted and is retried at the next logon)"
+    $note = if ($TestEmail) { '(test email)' } else { '(a weekly check is not counted and is retried at the next logon)' }
+    Write-Log "ERROR    $($_.Exception.Message)  $note"
     $exitCode = 1
 }
 exit $exitCode

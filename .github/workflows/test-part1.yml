@@ -332,7 +332,51 @@ jobs:
           Set-Content -LiteralPath $keyFile -Value $goodKey.Trim() -Encoding ASCII
           Complete-Assertions
 
-      - name: 10. Uninstall-WeeklyCheck.ps1
+      - name: 10. Set-WeeklyCheckApiKey.ps1 (change the key, send a test)
+        if: ${{ !cancelled() && steps.weekly_install.conclusion == 'success' }}
+        run: |
+          . .\tests\TestHelpers.ps1
+          $keyFile    = Join-Path $StateDir 'weekly-resend.key'
+          $keyBefore  = Get-Content -LiteralPath $keyFile -Raw
+          $stateBefore = Get-Content -LiteralPath $WeeklyState -Raw
+
+          # A ^V key is refused and the stored key is left alone.
+          $refused = $null
+          try { & .\Set-WeeklyCheckApiKey.ps1 -ApiKey (ConvertTo-SecureString ("re_test" + [char]0x16) -AsPlainText -Force) *> $null }
+          catch { $refused = $_.Exception.Message }
+          Assert-True ($refused -match 'control characters' -and $refused -match 'Nothing was changed') "A ^V key is refused (got: $refused)"
+          Assert-True ((Get-Content -LiteralPath $keyFile -Raw) -eq $keyBefore) 'Stored key unchanged after the refused one'
+
+          # A new key (with a stray space) replaces the old one and a test email goes out with it.
+          $newKey = 're_test_new_key_after_change_42'
+          $mailBefore = @(Get-ChildItem -LiteralPath $Outbox -Filter '*.json' | ForEach-Object { $_.FullName })
+          & .\Set-WeeklyCheckApiKey.ps1 -ApiKey (ConvertTo-SecureString "$newKey " -AsPlainText -Force) *>&1 |
+              Tee-Object -FilePath (Join-Path $ArtifactDir 'set-key-output.txt')
+          $out = Get-Content -LiteralPath (Join-Path $ArtifactDir 'set-key-output.txt')
+          Assert-True ($out -match 'Check your inbox') 'Set-WeeklyCheckApiKey.ps1 reports the test email was sent'
+          Assert-True (-not ($out -match [regex]::Escape($newKey))) 'The new key is never printed'
+
+          $stored = (Get-Content -LiteralPath $keyFile -Raw).Trim()
+          $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(($stored | ConvertTo-SecureString))
+          $decrypted = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+          Assert-True ($decrypted -eq $newKey) 'Stored key is now the new one (trimmed), DPAPI-encrypted for this user'
+          $readers = Get-OtherAccess $keyFile 'ReadData' 'S-1-5-18', 'S-1-5-32-544', ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+          Assert-True ($readers.Count -eq 0) "Key file still readable only by this user, SYSTEM and Administrators (others: $($readers -join '; '))"
+
+          $mails = @(Get-ChildItem -LiteralPath $Outbox -Filter '*.json' | Where-Object { $mailBefore -notcontains $_.FullName } |
+              ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json })
+          Assert-True ($mails.Count -eq 1) "One test email (got $($mails.Count))"
+          if ($mails.Count) {
+              Assert-True ($mails[0].email.subject -match 'test email') "Subject is the test email (got '$($mails[0].email.subject)')"
+              Assert-True (@($mails[0].email.to) -contains 'teddaharry@gmail.com') 'Test email goes to teddaharry@gmail.com'
+              Assert-True ($mails[0].keyLength -eq $newKey.Length) 'Test email used the new key'
+          }
+          Assert-True ((Get-Content -LiteralPath $WeeklyLog -Tail 1) -match '\bTEST\s+email') 'weekly.log records the TEST email'
+          Assert-True ((Get-Content -LiteralPath $WeeklyState -Raw) -eq $stateBefore) 'The test did not count as a weekly check (state unchanged)'
+          Assert-True (Get-ScheduledTask -TaskName $WeeklyTask -ErrorAction SilentlyContinue) 'Task still installed (no reinstall needed)'
+          Complete-Assertions
+
+      - name: 11. Uninstall-WeeklyCheck.ps1
         if: ${{ !cancelled() && steps.weekly_install.conclusion == 'success' }}
         run: |
           . .\tests\TestHelpers.ps1
@@ -344,7 +388,7 @@ jobs:
           Assert-True (Test-Path -LiteralPath $WeeklyLog) 'weekly.log kept by default'
           Complete-Assertions
 
-      - name: 11. Disable-Auditing.ps1
+      - name: 12. Disable-Auditing.ps1
         if: ${{ !cancelled() && steps.enable.conclusion == 'success' }}
         run: |
           . .\tests\TestHelpers.ps1
