@@ -4,7 +4,7 @@
 # Part 2: Install-RepairTask -> strip folders -> the SYSTEM task must repair them,
 #         on demand and from the audit event -> Uninstall-RepairTask.
 # Weekly: Install-WeeklyCheck (test mode: emails written to files, not sent) ->
-#         clear / skip / streak / problems runs of the task -> Uninstall-WeeklyCheck.
+#         weekly / logon / streak / problems runs of the task -> Uninstall-WeeklyCheck.
 # Finally Disable-Auditing must restore everything.
 # The runner is elevated, so the scripts run as they would from an admin prompt.
 name: Test parts 1 and 2 + weekly check
@@ -212,8 +212,10 @@ jobs:
           Assert-True ($task.Principal.LogonType -eq 'Interactive') "Task runs only while the user is logged on (got '$($task.Principal.LogonType)')"
           $weekly = $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger' }
           Assert-True ($weekly -and $weekly.DaysOfWeek -eq 1 -and $weekly.StartBoundary -match 'T18:00:00') "Weekly trigger on Sunday 18:00 (got days=$($weekly.DaysOfWeek) start=$($weekly.StartBoundary))"
+          # A fixed UTC offset would shift the run by an hour when the clocks change.
+          Assert-True ($weekly.StartBoundary -notmatch '(Z|[+-]\d{2}:\d{2})$') "Weekly trigger is 18:00 local time, no UTC offset (got $($weekly.StartBoundary))"
           $logon = $task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }
-          Assert-True $logon 'Logon trigger (to catch up a missed Sunday)'
+          Assert-True ($logon -and $logon.UserId -like "*$env:USERNAME") "Logon trigger for this user, so it checks at every logon (got '$($logon.UserId)')"
           Assert-True $task.Settings.StartWhenAvailable 'Runs as soon as possible after a missed start'
 
           # The key: stored, encrypted (never plain text), only this user can decrypt and read it.
@@ -239,7 +241,7 @@ jobs:
           Assert-True (-not ($out -match '\bWARN\b' -notmatch 'TEST MODE')) 'Installer printed no warnings apart from test mode'
           Complete-Assertions
 
-      - name: 9. Weekly check runs (clear, skip, streak, problems)
+      - name: 9. Weekly check runs (weekly, logon, streak, problems)
         if: ${{ !cancelled() && steps.weekly_install.conclusion == 'success' }}
         run: |
           . .\tests\TestHelpers.ps1
@@ -247,11 +249,12 @@ jobs:
           foreach ($f in $TestFolder, $RepairFolderA, $RepairFolderB, $WeeklyFolder) {
               if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Recurse -Force }
           }
+          function Get-Streak { (Get-Content -LiteralPath $WeeklyState -Raw | ConvertFrom-Json).clearStreak }
 
-          Write-Host '--- a) First run: never checked, so due -> all clear, 1 week'
+          Write-Host '--- a) First run: never checked, so it is the weekly one -> all-clear email, 1 week'
           $r = Invoke-WeeklyTaskRun
           Assert-True ($r.Finished -and $r.ExitCode -eq 0) "a) task run finished with exit code 0 (got $($r.ExitCode))"
-          Assert-True ($r.Log -match 'CLEAR\s.*\b1 week\(s\) in a row') 'a) weekly.log records CLEAR, 1 week'
+          Assert-True ($r.Log -match 'WEEKLY CLEAR\s.*\b1 week\(s\) in a row') 'a) weekly.log records WEEKLY CLEAR, 1 week'
           Assert-True ($r.Emails.Count -eq 1) "a) one email (got $($r.Emails.Count))"
           if ($r.Emails.Count) {
               $e = $r.Emails[0]
@@ -261,37 +264,47 @@ jobs:
               Assert-True ($e.keyLength -eq 're_test_not_a_real_key_0123456789'.Length) 'a) the task (running as the user) decrypted the API key'
           }
 
-          Write-Host '--- b) Again in the same week -> SKIP, no email'
+          Write-Host '--- b) Logon later that week, all clear -> logged, no email'
           $r = Invoke-WeeklyTaskRun
-          Assert-True ($r.ExitCode -eq 0 -and $r.Log -match '\bSKIP\b') 'b) second run this week is skipped'
+          Assert-True ($r.ExitCode -eq 0 -and $r.Log -match 'LOGON\s+CLEAR\s.*not sent') 'b) weekly.log records LOGON CLEAR, not sent'
           Assert-True ($r.Emails.Count -eq 0) "b) no email (got $($r.Emails.Count))"
+          Assert-True ((Get-Streak) -eq 1) "b) clear-weeks count unchanged at 1 (got $(Get-Streak))"
 
-          Write-Host '--- c) A week later -> all clear, 2 weeks'
+          Write-Host '--- c) The next Sunday -> all-clear email, 2 weeks'
           Set-WeeklyLastCheckDaysAgo 8
           $r = Invoke-WeeklyTaskRun
           Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.subject -match '\(2 weeks in a row\)') "c) subject says 2 weeks in a row (got '$($r.Emails.email.subject)')"
 
-          Write-Host '--- d) A folder loses SYSTEM/Administrators -> problems email'
+          Write-Host '--- d) A folder loses SYSTEM/Administrators, next logon -> problems email straight away'
           New-StrippedTestFolder $WeeklyFolder
-          Set-WeeklyLastCheckDaysAgo 8
           $r = Invoke-WeeklyTaskRun
-          Assert-True ($r.ExitCode -eq 0 -and $r.Log -match 'PROBLEMS\s.*PermissionTrap\.WeeklyTestC') 'd) weekly.log records PROBLEMS with the folder'
-          Assert-True ($r.Emails.Count -eq 1) "d) one email (got $($r.Emails.Count))"
+          Assert-True ($r.ExitCode -eq 0 -and $r.Log -match 'LOGON\s+PROBLEMS\s.*PermissionTrap\.WeeklyTestC') 'd) weekly.log records LOGON PROBLEMS with the folder'
+          Assert-True ($r.Emails.Count -eq 1) "d) one email at logon (got $($r.Emails.Count))"
           if ($r.Emails.Count) {
               $m = $r.Emails[0].email
               Assert-True ($m.subject -match '1 folder\(s\) missing SYSTEM/Administrators') "d) subject reports 1 folder (got '$($m.subject)')"
+              Assert-True ($m.text -match '^The check at logon') 'd) text says it was the check at logon'
               Assert-True ($m.text -match 'PermissionTrap\.WeeklyTestC - missing SYSTEM and Administrators') 'd) text lists the folder and what is missing'
               Assert-True ($m.text -match 'Get-PermissionReport\.ps1' -and $m.text -match 'as administrator') 'd) text says to run Get-PermissionReport.ps1 elevated'
               Assert-True ($m.html -match 'PermissionTrap\.WeeklyTestC') 'd) HTML version lists the folder too'
           }
-          $state = Get-Content -LiteralPath $WeeklyState -Raw | ConvertFrom-Json
-          Assert-True ($state.clearStreak -eq 0) "d) clear streak reset to 0 (got $($state.clearStreak))"
+          Assert-True ((Get-Streak) -eq 0) "d) clear-weeks count reset to 0 (got $(Get-Streak))"
 
-          Write-Host '--- e) Fixed, next week -> all clear, streak starts again at 1'
+          Write-Host '--- e) Still broken at the following logon -> emails again'
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.Emails.Count -eq 1 -and $r.Log -match 'LOGON\s+PROBLEMS') "e) another problems email (got $($r.Emails.Count))"
+
+          Write-Host '--- f) Still broken on Sunday -> the weekly email reports it'
+          Set-WeeklyLastCheckDaysAgo 8
+          $r = Invoke-WeeklyTaskRun
+          Assert-True ($r.Log -match 'WEEKLY PROBLEMS') 'f) weekly.log records WEEKLY PROBLEMS'
+          Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.text -match '^The weekly check') "f) problems email says it was the weekly check"
+
+          Write-Host '--- g) Fixed, next Sunday -> all clear, count starts again at 1'
           Remove-Item -LiteralPath $WeeklyFolder -Recurse -Force
           Set-WeeklyLastCheckDaysAgo 8
           $r = Invoke-WeeklyTaskRun
-          Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.subject -match '\(1 week in a row\)') "e) streak restarted at 1 week (got '$($r.Emails.email.subject)')"
+          Assert-True ($r.Emails.Count -eq 1 -and $r.Emails[0].email.subject -match '\(1 week in a row\)') "g) count restarted at 1 week (got '$($r.Emails.email.subject)')"
           Complete-Assertions
 
       - name: 10. Uninstall-WeeklyCheck.ps1

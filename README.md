@@ -5,7 +5,7 @@ Finds out what keeps removing `SYSTEM` and `Administrators` from
 
 - **Part 1:** sets up Windows auditing and gives you a report to run by hand.
 - **Part 2:** adds a scheduled task that repairs the permissions automatically.
-- **Weekly check:** emails you every Sunday saying whether anything is broken.
+- **Weekly check:** checks every Sunday and at every logon. It emails you every Sunday, and straight away at logon if anything is broken.
 
 Run all scripts from **your own account** in an **elevated** Windows PowerShell 5.1
 ("Run as administrator"). Each script uses `%LOCALAPPDATA%` to find the Packages
@@ -32,12 +32,12 @@ powershell -ExecutionPolicy Bypass -File .\Enable-Auditing.ps1
 | `Repair-Permissions.ps1` | What the task runs. It finds folders with no SYSTEM or Administrators entry and backs up their permissions (`icacls /save`, into `backups\<time>\<folder>.acl`). Then it grants only the missing ones, `(OI)(CI)F`, recursively for app folders. It **only adds**: no `/reset`, no `/remove`, and it doesn't change inheritance or the owner. Each fix goes to `repair.log`. After a fix it checks again 30 s later, in case the culprit is still working. A run that finds nothing broken changes nothing and logs nothing, so its own permission changes can't make it loop. |
 | `Uninstall-RepairTask.ps1` | Removes the task and the copied script. It keeps `repair.log` and the backups unless you pass `-RemoveLogsAndBackups`. Permissions it already repaired stay as they are. |
 
-### Weekly check — email every Sunday
+### Weekly check — Sunday email, plus a check at every logon
 
 | Script | What it does |
 |---|---|
-| `Install-WeeklyCheck.ps1` | Registers `PermissionTrap-WeeklyCheck`. It runs as **you, not elevated**, every Sunday at 18:00, and 2 minutes after you log on if that run was missed. It prompts for your Resend API key, with the input hidden, and stores it encrypted with DPAPI for your Windows account only (`weekly-resend.key`). The key is never written in plain text. Emails go from `info@rossmackenzie.co.uk` to `teddaharry@gmail.com`; change that with `-From` / `-To`. The installer needs an elevated window to write to `C:\ProgramData\PermissionTrap`, but run it from your own account. |
-| `Invoke-WeeklyCheck.ps1` | What the task runs. It does the same check as part 1 of the report. If something is broken, it emails the affected folders and tells you to run `Get-PermissionReport.ps1` elevated. Otherwise it emails "all clear" with how many weeks in a row it's been clear. Each run goes in `weekly.log`. If sending fails, the week doesn't count and it tries again at your next logon. |
+| `Install-WeeklyCheck.ps1` | Registers `PermissionTrap-WeeklyCheck`. It runs as **you, not elevated**, every Sunday at 18:00 local time, and 2 minutes after every logon. It prompts for your Resend API key, with the input hidden, and stores it encrypted with DPAPI for your Windows account only (`weekly-resend.key`). The key is never written in plain text. Emails go from `info@rossmackenzie.co.uk` to `teddaharry@gmail.com`; change that with `-From` / `-To`. The installer needs an elevated window to write to `C:\ProgramData\PermissionTrap`, but run it from your own account. |
+| `Invoke-WeeklyCheck.ps1` | What the task runs. It does the same check as part 1 of the report and logs each run to `weekly.log`. **Sunday check** (or the first logon after a missed Sunday): it always emails, either the affected folders with an instruction to run `Get-PermissionReport.ps1` elevated, or "all clear" with how many weeks in a row it's been clear. If sending fails, it tries again at your next logon. **Logon check**: it emails only if something is broken; an all-clear is just logged. Finding problems resets the clear-weeks count. |
 | `Uninstall-WeeklyCheck.ps1` | Removes the task, its script and settings, and the stored API key. It keeps `weekly.log` and the clear-weeks count unless you pass `-RemoveLogs`. |
 
 The task only runs while you're logged on: DPAPI can only decrypt your key while you're logged on.

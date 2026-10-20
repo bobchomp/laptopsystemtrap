@@ -2,9 +2,11 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Registers the PermissionTrap-WeeklyCheck scheduled task: every Sunday at
-    18:00 (and at your next logon if that was missed) it checks
-    %LOCALAPPDATA%\Packages and emails you the result via Resend.
+    Registers the PermissionTrap-WeeklyCheck scheduled task: it checks
+    %LOCALAPPDATA%\Packages every Sunday at 18:00 and every time you log on.
+    The Sunday check always emails you (problems, or all clear); a logon
+    check emails only if something is broken. A missed Sunday check is done
+    at your next logon instead.
 
 .DESCRIPTION
     - Prompts for your Resend API key (input hidden) and stores it encrypted
@@ -18,8 +20,7 @@
       the check runs unelevated.
     - Registers the task: runs as you, NOT elevated, only while you are logged
       on (DPAPI needs your logon to decrypt the key). Triggers: Sunday 18:00,
-      and 2 minutes after you log on. The script itself skips the logon run
-      if this week's check was already done.
+      and 2 minutes after every logon.
 
     Needs an elevated PowerShell (to write to C:\ProgramData\PermissionTrap),
     run from your own account: the task and the key belong to whoever runs this.
@@ -147,6 +148,9 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
     "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$TargetScript`"")
 
 $weekly = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '18:00'
+# Drop the UTC offset New-ScheduledTaskTrigger adds (e.g. 18:00+01:00 in summer),
+# which would make it fire at 17:00 in winter. Without it, 18:00 is local time all year.
+$weekly.StartBoundary = $weekly.StartBoundary -replace '(Z|[+-]\d{2}:\d{2})$', ''
 $logon  = New-ScheduledTaskTrigger -AtLogOn -User $Me.Name
 $logon.Delay = 'PT2M'   # give the network a moment after logon
 
@@ -160,7 +164,7 @@ $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhen
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($weekly, $logon) -Principal $principal -Settings $settings `
     -Description "Weekly check of $PackagesPath for missing SYSTEM/Administrators; emails $($To -join ', '). Installed by Install-WeeklyCheck.ps1; logs to $LogFile." `
     -Force | Out-Null
-Write-Ok "Registered: Sundays 18:00, and at logon if that was missed"
+Write-Ok 'Registered: Sundays 18:00 (always emails) and every logon (emails only if something is broken)'
 
 Write-Host ''
 Write-Host 'Done.' -ForegroundColor Green

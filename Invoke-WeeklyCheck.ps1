@@ -1,31 +1,32 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Weekly check of %LOCALAPPDATA%\Packages, emailed via Resend. Run by the
-    PermissionTrap-WeeklyCheck scheduled task (as you, not elevated); you do
-    not normally run it yourself.
+    Checks %LOCALAPPDATA%\Packages and emails you via Resend. Run by the
+    PermissionTrap-WeeklyCheck scheduled task (as you, not elevated) every
+    Sunday at 18:00 and at every logon; you do not normally run it yourself.
 
 .DESCRIPTION
-    1. Decides whether this week's check is due: it is if no check has
-       succeeded since the most recent Sunday 18:00. The task also runs at
-       every logon, so a check missed while the laptop was off happens at
-       the next logon; otherwise it logs SKIP and stops. -Force skips this.
-    2. Checks Packages and every app folder in it for missing SYSTEM
-       (S-1-5-18) or Administrators (S-1-5-32-544) - the same check as part 1
-       of Get-PermissionReport.ps1.
-    3. Emails the result via Resend: the affected folders and what to do, or
-       "all clear" with how many weekly checks in a row have been clear.
-    4. Logs the run to C:\ProgramData\PermissionTrap\weekly.log.
+    Every run checks Packages and every app folder in it for missing SYSTEM
+    (S-1-5-18) or Administrators (S-1-5-32-544) - the same check as part 1 of
+    Get-PermissionReport.ps1 - and logs the result to
+    C:\ProgramData\PermissionTrap\weekly.log. What it emails depends on the run:
 
-    If the email cannot be sent, the check is not counted as done, so it is
-    tried again at the next logon or Sunday.
+    WEEKLY - no weekly check has succeeded since the most recent Sunday 18:00
+             (the Sunday run, or the first logon after a missed Sunday):
+             always emails - the affected folders, or "all clear" with how
+             many weeks in a row it has been clear. If sending fails, the week
+             is not counted and the next logon tries again.
+    LOGON  - any other run (every logon, or starting the task by hand):
+             emails only if something is broken; an all-clear is just logged.
+
+    Finding problems resets the clear-weeks count to 0.
 
     Settings come from weekly-config.json, written by Install-WeeklyCheck.ps1.
     The Resend API key is in weekly-resend.key, encrypted with DPAPI for your
     Windows account only.
 
 .PARAMETER Force
-    Run the check even if this week's check was already done.
+    Treat this run as the weekly one even if this week's was already done.
 #>
 [CmdletBinding()]
 param(
@@ -106,18 +107,20 @@ function Find-Problems([string]$PackagesPath) {
 function Get-ApiKey {
     # ConvertTo-SecureString without -Key reverses ConvertFrom-SecureString's
     # DPAPI (CurrentUser) encryption. Only this Windows account can do it.
-    $secure = Get-Content -LiteralPath $KeyFile -Raw | ConvertTo-SecureString
+    # Trim: the file ends with a newline, which ConvertTo-SecureString rejects.
+    $secure = (Get-Content -LiteralPath $KeyFile -Raw).Trim() | ConvertTo-SecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
     try     { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
-function New-Email($Config, $Result, [int]$Streak) {
+function New-Email($Config, $Result, [int]$Streak, [bool]$Weekly) {
     $computer = $env:COMPUTERNAME
     $count    = $Result.Problems.Count
     if ($count) {
         $subject = "Permission Trap: $count folder(s) missing SYSTEM/Administrators on $computer"
-        $intro   = "The weekly check on $computer found $count of $($Result.Checked) folder(s) in $($Config.packagesPath) missing SYSTEM and/or Administrators. Store apps that use these folders may fail to start."
+        $when    = if ($Weekly) { 'The weekly check' } else { 'The check at logon' }
+        $intro   = "$when on $computer found $count of $($Result.Checked) folder(s) in $($Config.packagesPath) missing SYSTEM and/or Administrators. Store apps that use these folders may fail to start."
         $items   = @($Result.Problems | ForEach-Object { "$($_.Name) - missing $($_.Missing)" })
         $todo    = @(
             'To find out what did it, open PowerShell as administrator on the laptop and run:',
@@ -186,40 +189,43 @@ try {
               elseif ($state.lastCheck)         { [datetime]::Parse($state.lastCheck, $null, 'RoundtripKind') }
               else                              { $null }
 
-    if (-not $Force -and $last -and $last -ge $due) {
-        Write-Log "SKIP     already checked $($last.ToString('yyyy-MM-dd HH:mm')) (since Sunday $($due.ToString('yyyy-MM-dd')) 18:00)"
-    } elseif (-not (Test-Path -LiteralPath $config.packagesPath -PathType Container)) {
+    if (-not (Test-Path -LiteralPath $config.packagesPath -PathType Container)) {
         Write-Log "ERROR    Packages folder not found: $($config.packagesPath)"
         $exitCode = 1
     } else {
-        $result = Find-Problems $config.packagesPath
+        # WEEKLY if this week's emailed check has not happened yet, else LOGON.
+        $weekly   = $Force -or -not $last -or $last -lt $due
+        $kind     = if ($weekly) { 'WEEKLY' } else { 'LOGON ' }
+        $result   = Find-Problems $config.packagesPath
+        $problems = $result.Problems.Count
 
-        # Consecutive clear weekly checks. A forced re-run in the same week
-        # does not add a week.
-        $newWeek = -not $last -or $last -lt $due
-        $streak  = if ($result.Problems.Count) { 0 }
-                   elseif ($newWeek)           { [int]$state.clearStreak + 1 }
-                   else                        { [Math]::Max(1, [int]$state.clearStreak) }
+        # Consecutive clear weekly checks: +1 per clear weekly check, 0 as soon
+        # as any check finds problems, unchanged by a clear logon check.
+        $streak = if ($problems)  { 0 }
+                  elseif ($weekly) { [int]$state.clearStreak + 1 }
+                  else             { [int]$state.clearStreak }
 
-        $email = New-Email $config $result $streak
-        $sent  = Send-Email $config $email
+        $sent = 'not sent (all clear at logon; only the weekly check emails an all-clear)'
+        if ($weekly -or $problems) {
+            $sent = 'email ' + (Send-Email $config (New-Email $config $result $streak $weekly))
+        }
 
-        $state.lastCheck   = (Get-Date).ToString('o')
-        $state.lastResult  = $(if ($result.Problems.Count) { 'problems' } else { 'clear' })
+        if ($weekly) { $state.lastCheck = (Get-Date).ToString('o') }
+        $state.lastResult  = $(if ($problems) { 'problems' } else { 'clear' })
         $state.clearStreak = $streak
         $state | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
 
         $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
                         [Security.Principal.WindowsBuiltInRole]::Administrator)
         $who = "as $([Security.Principal.WindowsIdentity]::GetCurrent().Name), elevated: $elevated"
-        if ($result.Problems.Count) {
-            Write-Log "PROBLEMS $($result.Problems.Count) of $($result.Checked) folder(s): $(($result.Problems | ForEach-Object { "$($_.Name) [$($_.Missing)]" }) -join '; ')  email $sent  ($who)"
+        if ($problems) {
+            Write-Log "$kind PROBLEMS $problems of $($result.Checked) folder(s): $(($result.Problems | ForEach-Object { "$($_.Name) [$($_.Missing)]" }) -join '; ')  $sent  ($who)"
         } else {
-            Write-Log "CLEAR    $($result.Checked) folder(s) OK, $streak week(s) in a row  email $sent  ($who)"
+            Write-Log "$kind CLEAR    $($result.Checked) folder(s) OK, $streak week(s) in a row  $sent  ($who)"
         }
     }
 } catch {
-    Write-Log "ERROR    $($_.Exception.Message)  (check not counted; will retry at next logon or Sunday)"
+    Write-Log "ERROR    $($_.Exception.Message)  (a weekly check is not counted and is retried at the next logon)"
     $exitCode = 1
 }
 exit $exitCode
