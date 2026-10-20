@@ -172,12 +172,20 @@ jobs:
         if: ${{ !cancelled() && steps.install.conclusion == 'success' }}
         run: |
           . .\tests\TestHelpers.ps1
-          Wait-RepairTaskIdle | Out-Null   # an earlier run would make the scheduler skip this trigger
+          # Step 5's own repair logs a permission change too, which starts the task
+          # again 30 s later. Let that leftover run fire and finish first, or it can
+          # repair this folder and hide whether this folder's own trigger works.
+          Wait-Until 120 { (Get-ScheduledTask -TaskName $RepairTask).State -ne 'Running' -and
+                           ((Get-Date) - (Get-Item -LiteralPath $RepairLog).LastWriteTime).TotalSeconds -gt 45 } | Out-Null
+          Wait-RepairTaskIdle | Out-Null   # a running instance would make the scheduler skip this trigger
           New-StrippedTestFolder $RepairFolderB
+          $stripped = Get-Date
           # The trigger waits 30 s after the event, then the repair runs.
           $ok = Wait-Until 180 { (Test-HasSid $RepairFolderB 'S-1-5-18') -and (Test-Path -LiteralPath $RepairLog) -and
                                  (Select-String -LiteralPath $RepairLog -Pattern 'FIXED\s+PermissionTrap\.RepairTestB\s' -Quiet) }
-          Write-Host "Repaired by the event trigger within 180 s: $ok"; & icacls.exe $RepairFolderB
+          $after = ((Get-Date) - $stripped).TotalSeconds
+          Write-Host ("Repaired by the event trigger within 180 s: $ok, after {0:N0} s" -f $after); & icacls.exe $RepairFolderB
+          Assert-True ($after -ge 25) ("Repair came from this folder's own delayed event trigger (after {0:N0} s; the trigger waits 30 s)" -f $after)
           Assert-Repaired $RepairFolderB
           Complete-Assertions
 
