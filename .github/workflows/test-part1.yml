@@ -221,7 +221,7 @@ jobs:
           # The key: stored, encrypted (never plain text), only this user can decrypt and read it.
           $keyFile = Join-Path $StateDir 'weekly-resend.key'
           Assert-True (Test-Path -LiteralPath $keyFile) 'API key file written'
-          $stored = Get-Content -LiteralPath $keyFile -Raw
+          $stored = (Get-Content -LiteralPath $keyFile -Raw).Trim()   # the file ends with a newline
           Assert-True ($stored -notmatch [regex]::Escape($testKey)) 'API key is not stored in plain text'
           $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(($stored | ConvertTo-SecureString))
           $decrypted = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
