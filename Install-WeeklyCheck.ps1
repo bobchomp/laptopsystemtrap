@@ -111,6 +111,7 @@ Write-Step "Copying the check and its settings to $StateDir"
 Copy-Item -LiteralPath $SourceScript -Destination $TargetScript -Force
 [ordered]@{
     packagesPath = $PackagesPath
+    scriptsPath  = $PSScriptRoot   # shown in the "run the report" instructions in problem emails
     from         = $From
     to           = @($To)
     outboxPath   = $(if ($OutboxPath) { $OutboxPath } else { $null })

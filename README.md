@@ -221,5 +221,5 @@ machine on each push: auditing and the report, the SYSTEM repair task
 (on demand and from the audit event), the weekly/logon emails, changing the
 API key, and every uninstaller. It never sends a real email — the weekly
 check is installed in test mode (`-OutboxPath`), which writes each email to a
-file instead. The reports, logs and test emails are uploaded as the
-`test-results` download on each run.
+file instead. The reports, logs and test emails (each also saved as an `.html` file you can
+open in a browser) are uploaded as the `test-results` download on each run.

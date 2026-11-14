@@ -283,6 +283,7 @@ jobs:
               Assert-True ($e.email.from -like '*<info@rossmackenzie.co.uk>') 'a) email from info@rossmackenzie.co.uk'
               Assert-True ($e.email.subject -match 'all clear' -and $e.email.subject -match '\(1 week in a row\)') "a) subject says all clear, 1 week (got '$($e.email.subject)')"
               Assert-True ($e.keyLength -eq 're_test_not_a_real_key_0123456789'.Length) 'a) the task (running as the user) decrypted the API key'
+              Assert-True ($e.email.html -match '^<!DOCTYPE html>' -and $e.email.html -match 'All clear' -and $e.email.html -match 'Next weekly email') 'a) HTML is the styled all-clear email'
           }
 
           Write-Host '--- b) Logon later that week, all clear -> logged, no email'
@@ -308,6 +309,9 @@ jobs:
               Assert-True ($m.text -match 'PermissionTrap\.WeeklyTestC - missing SYSTEM and Administrators') 'd) text lists the folder and what is missing'
               Assert-True ($m.text -match 'Get-PermissionReport\.ps1' -and $m.text -match 'as administrator') 'd) text says to run Get-PermissionReport.ps1 elevated'
               Assert-True ($m.html -match 'PermissionTrap\.WeeklyTestC') 'd) HTML version lists the folder too'
+              Assert-True ($m.html -match '^<!DOCTYPE html>' -and $m.html -match '1 folder needs attention' -and $m.html -match 'no SYSTEM' -and $m.html -match 'no Administrators') 'd) HTML is the styled problems email, with what the folder is missing'
+              $cdLine = "cd `"$((Get-Location).Path)`""
+              Assert-True ($m.text -match [regex]::Escape($cdLine)) "d) instructions cd to the folder the scripts were installed from ($cdLine)"
           }
           Assert-True ((Get-Streak) -eq 0) "d) clear-weeks count reset to 0 (got $(Get-Streak))"
 
@@ -376,6 +380,7 @@ jobs:
           Assert-True ($mails.Count -eq 1) "One test email (got $($mails.Count))"
           if ($mails.Count) {
               Assert-True ($mails[0].email.subject -match 'test email') "Subject is the test email (got '$($mails[0].email.subject)')"
+              Assert-True ($mails[0].email.html -match '^<!DOCTYPE html>' -and $mails[0].email.html -match 'Test email') 'Test email uses the styled layout'
               Assert-True (@($mails[0].email.to) -contains 'teddaharry@gmail.com') 'Test email goes to teddaharry@gmail.com'
               Assert-True ($mails[0].keyLength -eq $newKey.Length) 'Test email used the new key'
           }

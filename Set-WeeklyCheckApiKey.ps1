@@ -106,6 +106,18 @@ if ((Test-Path -LiteralPath $SourceScript) -and
     Write-Ok 'Updated the installed weekly check to the version next to this script'
 }
 
+# Problem emails tell you which folder to run Get-PermissionReport.ps1 from;
+# record this one (installs from before that setting existed lack it).
+$configFile = Join-Path $StateDir 'weekly-config.json'
+if (Test-Path -LiteralPath $configFile) {
+    $config = Get-Content -LiteralPath $configFile -Raw | ConvertFrom-Json
+    if (-not $config.PSObject.Properties['scriptsPath'] -or $config.scriptsPath -ne $PSScriptRoot) {
+        $config | Add-Member -NotePropertyName scriptsPath -NotePropertyValue $PSScriptRoot -Force
+        $config | ConvertTo-Json | Set-Content -LiteralPath $configFile -Encoding UTF8
+        Write-Ok "Problem emails will say to run the report from $PSScriptRoot"
+    }
+}
+
 # --- Test email -------------------------------------------------------------------
 
 Write-Step 'Sending a test email'
