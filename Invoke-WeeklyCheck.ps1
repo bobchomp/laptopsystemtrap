@@ -221,8 +221,9 @@ function New-Email($Config, $Result, [int]$Streak, [bool]$Weekly) {
                     else { "  - $($_.Name) - missing $($_.Missing)" } }) +
                 @('', 'To find out what did it, open PowerShell as administrator on the laptop and run:') +
                 @($commands | ForEach-Object { "    $_" }) +
-                @('Run the report before repairing anything. The line starting ">>> WHAT DID IT:" names the program responsible.',
-                  '', "-- Permission Trap on $computer. $schedule") -join "`r`n"
+                @('The line starting ">>> WHAT DID IT:" names the program responsible.',
+                  'Run the report before you repair anything: once a folder is repaired, the report no longer lists it as broken.',
+                  '', "Sent by Permission Trap on $computer. $schedule") -join "`r`n"
 
         # HTML version: a row per folder with what it is missing.
         $rows = foreach ($p in $Result.Problems) {
@@ -233,7 +234,7 @@ function New-Email($Config, $Result, [int]$Streak, [bool]$Weekly) {
             "<div style=`"margin-top:5px;`">$chips</div></td></tr>"
         }
         $body = @"
-<p style="margin:0 0 18px;">$(ConvertTo-Html $when) found <strong>$count of $checked</strong> app $plural without the permissions Windows needs. Store apps that use $(if ($count -eq 1) { 'it' } else { 'them' }) may fail to start.</p>
+<p style="margin:0 0 18px;">$(ConvertTo-Html $when) found <strong>$count of $checked</strong> app folders without the permissions Windows needs. Store apps that use $(if ($count -eq 1) { 'it' } else { 'them' }) may fail to start.</p>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #eceff3;border-radius:10px;border-collapse:separate;font-family:$Font;">
 <tr><td style="padding:9px 14px;background:#fafbfc;font-size:12px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:#6b7785;">Affected folders</td></tr>
 $($rows -join "`n")
@@ -242,7 +243,7 @@ $($rows -join "`n")
 <div style="font-size:15px;font-weight:700;color:#7a5200;margin-bottom:6px;">Find out what did it</div>
 <div style="font-size:14px;color:#4a3b12;">On the laptop, open PowerShell <strong>as administrator</strong> (Start &rarr; PowerShell &rarr; right-click &rarr; Run as administrator) and run:</div>
 $(New-CodeBlock $commands)
-<div style="font-size:14px;color:#4a3b12;margin-top:8px;">The line starting <span style="font-family:$Mono;font-size:13px;">&gt;&gt;&gt; WHAT DID IT:</span> names the program responsible. Run the report <strong>before</strong> repairing anything.</div>
+<div style="font-size:14px;color:#4a3b12;margin-top:8px;">The line starting <span style="font-family:$Mono;font-size:13px;">&gt;&gt;&gt; WHAT DID IT:</span> names the program responsible. Run the report before you repair anything: once a folder is repaired, the report no longer lists it as broken.</div>
 </div>
 "@
         $html = New-EmailPage -Accent '#c0392b' -Symbol '&#9888;' `
@@ -253,9 +254,9 @@ $(New-CodeBlock $commands)
     } else {
         $weeks   = if ($Streak -eq 1) { '1 week' } else { "$Streak weeks" }
         $subject = "Permission Trap: all clear on $computer ($weeks in a row)"
-        $intro   = "All clear: all $checked folder(s) in $path have SYSTEM and Administrators. That's $weeks in a row."
+        $intro   = "All clear for $weeks in a row: all $checked folder(s) in $path have SYSTEM and Administrators."
 
-        $text = @($intro, '', "Next weekly email: $next.", '', "-- Permission Trap on $computer. $schedule") -join "`r`n"
+        $text = @($intro, '', "Next weekly email: $next.", '', "Sent by Permission Trap on $computer. $schedule") -join "`r`n"
 
         # A dot per clear week (up to 12) under the big number.
         $dots = ('&#9679;' * [Math]::Min($Streak, 12)) + $(if ($Streak -gt 12) { '&hellip;' } else { '' })
@@ -273,7 +274,7 @@ $(New-CodeBlock $commands)
 "@
         $html = New-EmailPage -Accent '#1f8b4c' -Symbol '&#10003;' -Title 'All clear' `
             -Subtitle "$computer $([char]0xB7) $weeks in a row" `
-            -Preheader "All $checked folders OK $([char]0x2014) $weeks in a row. Next check $next." `
+            -Preheader "All $checked folders OK, $weeks in a row. Next weekly email: $next." `
             -Body $body -Footer (New-EmailFooter (ConvertTo-Html "Packages folder: $path. $schedule"))
     }
 
@@ -282,14 +283,14 @@ $(New-CodeBlock $commands)
 
 function New-TestEmail($Config) {
     $computer = $env:COMPUTERNAME
-    $text = "This is a test from Permission Trap on $computer. The Resend API key works; weekly checks will be emailed to this address."
+    $text = "This is a test from Permission Trap on $computer. The Resend API key works, and the weekly emails will come to this address."
     $body = @"
 <p style="margin:0 0 16px;">Your Resend API key works. Permission Trap on <strong>$(ConvertTo-Html $computer)</strong> will email this address:</p>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e1e8f5;border-radius:10px;border-collapse:separate;font-family:$Font;font-size:14px;color:#1f2933;">
-<tr><td style="padding:12px 16px;border-bottom:1px solid #e1e8f5;"><strong>Every Sunday at 18:00</strong><br><span style="color:#52606d;">Always &mdash; either all clear, or the folders that need attention.</span></td></tr>
+<tr><td style="padding:12px 16px;border-bottom:1px solid #e1e8f5;"><strong>Every Sunday at 18:00</strong><br><span style="color:#52606d;">Always: either all clear, or a list of the folders that need attention.</span></td></tr>
 <tr><td style="padding:12px 16px;"><strong>Each time you log on</strong><br><span style="color:#52606d;">Only if a folder is missing SYSTEM or Administrators.</span></td></tr>
 </table>
-<p style="margin:16px 0 0;color:#52606d;font-size:14px;">Nothing to do &mdash; this was only a test.</p>
+<p style="margin:16px 0 0;color:#52606d;font-size:14px;">This was only a test, so there's nothing to do.</p>
 "@
     [ordered]@{
         from = $Config.from; to = @($Config.to)
